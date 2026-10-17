@@ -24,6 +24,7 @@ def _create_native_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         headers=_native_headers,
         timeout=config.LM_STUDIO_TIMEOUT,
+        trust_env=False, 
     )
 
 

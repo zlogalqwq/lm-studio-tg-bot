@@ -945,26 +945,22 @@ def _pick_tail(prev: Optional[str]) -> str:
     return tail
 
 
-def _render_thinking_frame(tick: int, tail: str, elapsed: float) -> str:
+def _render_thinking_frame(tick: int, tail: str) -> str:
     emoji = _THINKING_EMOJIS[tick % len(_THINKING_EMOJIS)]
     verb = _THINKING_VERBS[tick % len(_THINKING_VERBS)]
 
     frame = f"{emoji} {verb}{tail}"
     if random.random() < _THINKING_ACCENT_CHANCE:
         frame += "\n<i>" + random.choice(_THINKING_ACCENTS) + "</i>"
-    if elapsed > 20:
-        frame += f"\n<i>⏱ {int(elapsed)} с…</i>"
     return frame
 
 
 async def _animate_thinking(status: Message, stop: asyncio.Event) -> None:
-    anim_start = time.monotonic()
     tick = 0
     prev_tail: Optional[str] = None
     while not stop.is_set():
         prev_tail = _pick_tail(prev_tail)
-        elapsed = time.monotonic() - anim_start
-        frame = _render_thinking_frame(tick, prev_tail, elapsed)
+        frame = _render_thinking_frame(tick, prev_tail)
 
         wait_time = random.uniform(_THINKING_MIN_INTERVAL, _THINKING_MAX_INTERVAL)
         try:

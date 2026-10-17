@@ -1,5 +1,8 @@
 @echo off
+title Telegram Bot (LM Studio)
+mode con cols=120 lines=40
 chcp 65001 >nul
+if not "%EXITCODE%"=="130" pause
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 

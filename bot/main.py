@@ -2,6 +2,14 @@ import asyncio
 import logging
 import os
 
+import aiohttp
+from aiogram.exceptions import (
+    TelegramConflictError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+    TelegramUnauthorizedError,
+)
 from aiogram.types import ErrorEvent
 from .core import bot, dp, router, close_lm_client, get_lm_client
 
@@ -43,6 +51,29 @@ async def _shutdown_resources() -> None:
         except Exception as exc:
             dump_exception(exc, context="shutdown.lm_client")
 
+async def _reset_bot_session() -> None:
+    """Пересоздаёт aiohttp-сессию бота после сетевой ошибки.
+
+    После WinError 121 / TLS-timeout коннектор aiohttp может остаться
+    в неработоспособном состоянии — все дальнейшие запросы падают
+    мгновенно. Пересоздание гарантирует, что следующий retry начнётся
+    с чистого коннектора.
+    """
+    try:
+        old_session = bot.session
+        try:
+            await old_session.close()
+        except Exception:
+            log.debug("reset session: close failed", exc_info=True)
+        try:
+            from aiogram.client.session.aiohttp import AiohttpSession
+
+            bot.session = AiohttpSession()
+            log.info("Bot session recreated")
+        except Exception as exc:
+            dump_exception(exc, context="reset_bot_session.create")
+    except Exception as exc:
+        dump_exception(exc, context="reset_bot_session")
 
 @router.startup()
 async def on_startup() -> None:
@@ -126,11 +157,26 @@ async def run() -> None:
 
     dp.message.middleware(middlewares.MediaGroupCollector())
 
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception as exc:
-        dump_exception(exc, context="delete_webhook")
-        log.warning("delete_webhook failed: %s", exc)
+    # delete_webhook с ретраями: при сетевой ошибке не сдаёмся сразу,
+    # иначе polling будет падать на «webhook is active».
+    for attempt in range(1, 4):
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            break
+        except TelegramRetryAfter as exc:
+            delay = float(exc.retry_after) + 1.0
+            log.warning("delete_webhook flood-wait %.1fs", delay)
+            await asyncio.sleep(delay)
+        except (TelegramNetworkError, TelegramServerError, aiohttp.ClientError) as exc:
+            log.warning(
+                "delete_webhook: network error (attempt %d/3): %s", attempt, exc
+            )
+            if attempt < 3:
+                await asyncio.sleep(min(2 ** attempt, 10))
+        except Exception as exc:
+            dump_exception(exc, context="delete_webhook")
+            log.warning("delete_webhook failed: %s", exc)
+            break
 
     # ── Retry-цикл polling: любые падения не убивают процесс. ──
     backoff = 1.0
@@ -143,21 +189,27 @@ async def run() -> None:
                 drop_pending_updates=True,
                 close_bot_session=False,
             )
-            # сюда попадаем только если polling завершился штатно
             break
         except (KeyboardInterrupt, SystemExit):
             raise
         except asyncio.CancelledError:
             log.info("Polling cancelled — shutting down")
             raise
-        except BaseException as exc:
-            # Пробуем записать дамп, но даже если не получится — идём дальше.
-            try:
-                dump_exception(exc, context="polling_loop")
-            except Exception:
-                pass
-            log.exception(
-                "Polling crashed; restarting in %.1fs", backoff
+
+        except TelegramUnauthorizedError as exc:
+            # Неверный токен: ретраи бессмысленны, процесс надо гасить.
+            dump_exception(exc, context="polling.unauthorized")
+            log.critical(
+                "Telegram отверг токен бота (401 Unauthorized). "
+                "Проверьте TELEGRAM_TOKEN в .env — процесс завершён."
+            )
+            raise
+
+        except TelegramConflictError:
+            # Другой экземпляр бота уже поллит. Ждём, вдруг он умрёт.
+            log.critical(
+                "Telegram Conflict: другой экземпляр бота использует тот же "
+                "токен. Остановите его. Повтор через %.1f с.", backoff
             )
             try:
                 await asyncio.sleep(backoff)
@@ -166,7 +218,49 @@ async def run() -> None:
             backoff = min(backoff * 2, MAX_BACKOFF)
             continue
 
-    try:
-        await _shutdown_resources()
-    except Exception as exc:
-        dump_exception(exc, context="run.final_shutdown")
+        except TelegramRetryAfter as exc:
+            delay = float(exc.retry_after) + 1.0
+            log.warning(
+                "Telegram flood-wait: retry_after=%.1fs — жду %.1fs",
+                exc.retry_after, delay,
+            )
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
+            continue
+
+        except (TelegramNetworkError, TelegramServerError, aiohttp.ClientError) as exc:
+            # Транзиентные сетевые ошибки — БЕЗ crash dump (иначе мусор),
+            # с пересозданием aiohttp-сессии (после WinError 121 коннектор мёртв).
+            log.warning(
+                "Сетевая ошибка Telegram (%s): %s — переподключаюсь через %.1f с",
+                type(exc).__name__, exc, backoff,
+            )
+            try:
+                await _reset_bot_session()
+            except Exception:
+                pass
+            try:
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                raise
+            backoff = min(backoff * 2, MAX_BACKOFF)
+            continue
+
+        except BaseException as exc:
+            # Всё остальное — дампим и ретраим как раньше.
+            try:
+                dump_exception(exc, context="polling_loop")
+            except Exception:
+                pass
+            log.exception(
+                "Polling crashed with unexpected error; restarting in %.1f с",
+                backoff,
+            )
+            try:
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                raise
+            backoff = min(backoff * 2, MAX_BACKOFF)
+            continue
