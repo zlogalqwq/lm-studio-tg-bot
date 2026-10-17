@@ -20,7 +20,6 @@ LM_STUDIO_API_TOKEN: str = os.environ.get("LM_STUDIO_API_TOKEN", "")
 DEFAULT_MODEL: Optional[str] = os.environ.get("LM_STUDIO_MODEL") or None
 
 MAX_HISTORY_TURNS: int = int(os.environ.get("MAX_HISTORY_TURNS", "15"))
-MAX_IMAGES: int = int(os.environ.get("MAX_IMAGES", "5"))
 MAX_IMAGES_EXTENDED: int = int(os.environ.get("MAX_IMAGES_EXTENDED", "10"))
 
 MAX_IMAGE_BYTES: int = int(
@@ -29,12 +28,13 @@ MAX_IMAGE_BYTES: int = int(
 MAX_TOTAL_IMAGE_BYTES: int = int(
     os.environ.get("MAX_TOTAL_IMAGE_BYTES", str(20 * 1024 * 1024))
 )
-MAX_SINGLE_IMAGE_IN_EXTENDED_BYTES: int = int(
-    os.environ.get(
-        "MAX_SINGLE_IMAGE_IN_EXTENDED_BYTES",
-        str(MAX_TOTAL_IMAGE_BYTES // 2),
-    )
+MAX_IMAGE_BYTES: int = int(
+    os.environ.get("MAX_IMAGE_BYTES", str(20 * 1024 * 1024))
 )
+MAX_TOTAL_IMAGE_BYTES: int = int(
+    os.environ.get("MAX_TOTAL_IMAGE_BYTES", str(20 * 1024 * 1024))
+)
+
 LM_STUDIO_TIMEOUT: float = float(os.environ.get("LM_STUDIO_TIMEOUT", "120"))
 MEDIA_GROUP_LATENCY: float = 0.3
 CACHE_TTL: float = 30.0

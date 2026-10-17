@@ -158,6 +158,8 @@ async def cb_regenerate(query: CallbackQuery) -> None:
                 use_tools=await store.is_tools_enabled(),
                 thinking_enabled=thinking_enabled,
                 history_context=history_for_context,
+                loaded_context_length=loaded_ctx,                               
+                prev_prompt_tokens=await store.get_cumulative_tokens(user_id),  
             )
 
             if session_reset:

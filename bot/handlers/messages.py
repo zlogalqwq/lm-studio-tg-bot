@@ -1,15 +1,21 @@
+import asyncio
 import logging
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from aiogram import F
-from aiogram.filters import Command
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiogram.types import Message
 import httpx
 
 from ..core import router
 from .. import config
 from ..formatting import finalize_streamed
-from ..images import IMAGE_MIME_PREFIXES, build_content, images_from_album, images_from_message
+from ..images import (
+    IMAGE_MIME_PREFIXES,
+    build_content,
+    images_from_album,
+    images_from_message,
+)
 from ..keyboards import stop_keyboard, response_keyboard
 from ..storage import store
 from ..logging_utils import save_exchange, finalize_and_track
@@ -24,6 +30,11 @@ from ..lm import (
 
 log = logging.getLogger(__name__)
 
+# ── Ретраи скачивания файлов из Telegram ────────────────────────────────────
+_DOWNLOAD_MAX_ATTEMPTS = 3
+_DOWNLOAD_BASE_DELAY = 1.0
+_DOWNLOAD_MAX_DELAY = 8.0
+
 
 def _get_prompt_text(message: Message, album: Optional[List[Message]]) -> str:
     """Возвращает текст запроса: для альбома — первую непустую подпись, иначе text/caption."""
@@ -33,6 +44,55 @@ def _get_prompt_text(message: Message, album: Optional[List[Message]]) -> str:
             "",
         )
     return message.text or message.caption or ""
+
+
+async def _build_content_with_retry(
+    album: Optional[List[Message]],
+    message: Message,
+    user_id: int,
+) -> List[Dict[str, Any]]:
+    """Скачивает фото с ретраями при сетевых ошибках Telegram.
+
+    Ретраит только ``TelegramNetworkError`` / ``TelegramRetryAfter``.
+    Прочие исключения (битый ``file_id``, превышение размера и т.п.)
+    пробрасываются сразу — на них ретрай бессмысленен.
+    """
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, _DOWNLOAD_MAX_ATTEMPTS + 1):
+        try:
+            return await build_content(album, message, user_id)
+        except TelegramRetryAfter as exc:
+            last_exc = exc
+            delay = float(exc.retry_after) + 0.5
+            log.warning(
+                "build_content: retry_after=%.1fs (attempt %d/%d)",
+                delay, attempt, _DOWNLOAD_MAX_ATTEMPTS,
+            )
+            if attempt < _DOWNLOAD_MAX_ATTEMPTS:
+                await asyncio.sleep(delay)
+        except TelegramNetworkError as exc:
+            last_exc = exc
+            delay = min(
+                _DOWNLOAD_BASE_DELAY * (2 ** (attempt - 1)),
+                _DOWNLOAD_MAX_DELAY,
+            )
+            log.warning(
+                "build_content: network error (attempt %d/%d): %s — retry in %.1fs",
+                attempt, _DOWNLOAD_MAX_ATTEMPTS, exc, delay,
+            )
+            if attempt < _DOWNLOAD_MAX_ATTEMPTS:
+                await asyncio.sleep(delay)
+        except Exception:
+            # Не-сетевые ошибки — без ретраев.
+            raise
+
+    assert last_exc is not None
+    log.error(
+        "build_content: exhausted %d attempts — last error: %s",
+        _DOWNLOAD_MAX_ATTEMPTS, last_exc,
+    )
+    raise last_exc
+
 
 @router.message(
     (F.text & ~F.text.startswith("/")) | F.photo | F.document
@@ -74,15 +134,25 @@ async def handle_message(
             )
             if not has_text and not has_image:
                 doc = message.document
-                if doc is not None and not (doc.mime_type or "").startswith(IMAGE_MIME_PREFIXES):
+                if doc is not None and not (
+                    doc.mime_type or ""
+                ).startswith(IMAGE_MIME_PREFIXES):
                     await status.delete()
-                    await store.untrack_message(user_id, status.chat.id, status.message_id)
-                    sent = await message.answer("❌ Поддерживаются только изображения и текст.")
-                    await store.track_message(user_id, sent.chat.id, sent.message_id)
+                    await store.untrack_message(
+                        user_id, status.chat.id, status.message_id
+                    )
+                    sent = await message.answer(
+                        "❌ Поддерживаются только изображения и текст."
+                    )
+                    await store.track_message(
+                        user_id, sent.chat.id, sent.message_id
+                    )
                     return
 
             # ── 1. Готовим контент ДО каких-либо изменений истории ──
-            content = await build_content(album, message, user_id)
+            #        (скачивание фото идёт с ретраями — сеть у Telegram
+            #         периодически рвётся на SSL-handshake)
+            content = await _build_content_with_retry(album, message, user_id)
 
             model = await get_model()
             await sync_loaded_context_length()
@@ -106,7 +176,7 @@ async def handle_message(
             # ── 3. Снимок истории ДО добавления текущего сообщения ──
             history_for_context = await store.get_with_system(user_id)
 
-            # ── 4. Предупреждение о заполнении контекста (по эффективному счётчику). ──
+            # ── 4. Предупреждение о заполнении контекста. ──
             effective_used = settings.last_effective_tokens
             if effective_used <= 0:
                 effective_used = settings.last_prompt_tokens
@@ -127,7 +197,9 @@ async def handle_message(
                         f"Модель скоро начнёт обрезать историю. "
                         f"Начать с чистого листа: /clean"
                     )
-                    await store.track_message(user_id, warn.chat.id, warn.message_id)
+                    await store.track_message(
+                        user_id, warn.chat.id, warn.message_id
+                    )
 
             # ── 5. Теперь — в историю. ──
             await store.append_user(user_id, content)
@@ -148,6 +220,8 @@ async def handle_message(
                 use_tools=await store.is_tools_enabled(),
                 thinking_enabled=thinking_enabled,
                 history_context=history_for_context,
+                loaded_context_length=loaded_ctx,
+                prev_prompt_tokens=await store.get_cumulative_tokens(user_id),
             )
 
             if session_reset:
@@ -198,6 +272,29 @@ async def handle_message(
                 status, reply, message, stopped=stopped, stats=stats
             )
             await finalize_and_track(user_id, status, sent)
+
+        except TelegramNetworkError as exc:
+            # Ретраи в _build_content_with_retry не помогли — сеть до
+            # api.telegram.org стабильно недоступна.
+            log.warning(
+                "Telegram network error for user %s after retries: %s",
+                user_id, exc,
+            )
+            try:
+                await status.edit_text(
+                    "📡 <b>Не удалось скачать файл из Telegram.</b>\n\n"
+                    "Соединение с <code>api.telegram.org</code> "
+                    "обрывается — это сетевая ошибка, а не проблема "
+                    "с ботом.\n\n"
+                    "Что делать:\n"
+                    "• Подождать пару секунд и отправить фото ещё раз\n"
+                    "• Если повторяется постоянно — проверьте "
+                    "VPN/прокси и доступность Telegram из вашей сети",
+                    reply_markup=response_keyboard(),
+                )
+            except Exception:
+                pass
+
         except (RuntimeError, ValueError) as exc:
             try:
                 await status.edit_text(
@@ -227,6 +324,7 @@ async def handle_message(
         await store.end_generation(user_id)
         await store.release(user_id)
 
+
 # ── Неподдерживаемые типы медиа ──────────────────────────────────────────────
 
 async def _try_delete(message: Message) -> None:
@@ -235,7 +333,10 @@ async def _try_delete(message: Message) -> None:
     try:
         await message.delete()
     except Exception:
-        log.debug("Не удалось удалить сообщение %s", message.message_id, exc_info=True)
+        log.debug(
+            "Не удалось удалить сообщение %s",
+            message.message_id, exc_info=True,
+        )
 
 
 @router.message(F.sticker)
@@ -295,6 +396,7 @@ async def handle_audio(message: Message) -> None:
         "Отправь текстовый запрос или изображение."
     )
     await store.track_message(user_id, sent.chat.id, sent.message_id)
+
 
 @router.message(F.text.startswith("/"))
 async def cmd_unknown(message: Message) -> None:

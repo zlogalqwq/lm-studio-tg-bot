@@ -5,6 +5,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiogram.types import Message
 
 from . import config
@@ -14,13 +15,14 @@ log = logging.getLogger(__name__)
 
 IMAGE_MIME_PREFIXES = ("image/",)
 
+# ── Настройки ретраев при скачивании из Telegram ──
+_DOWNLOAD_MAX_ATTEMPTS = 3
+_DOWNLOAD_BASE_DELAY = 1.0
+_DOWNLOAD_MAX_DELAY = 8.0
+
 
 def _save_photo_sync(user_id: int, raw: bytes, ext: str) -> str:
-    """Сохраняет файл в saved_photos/<user_id>/<timestamp>.<ext>.
-
-    Папка пользователя создаётся при необходимости (включая саму
-    saved_photos). Коллизии по времени разрешаются суффиксом _N.
-    """
+    """Сохраняет файл в saved_photos/<user_id>/<timestamp>.<ext>."""
     user_dir = os.path.join(config.PHOTO_DIR, str(user_id))
     os.makedirs(user_dir, exist_ok=True)
 
@@ -36,26 +38,81 @@ def _save_photo_sync(user_id: int, raw: bytes, ext: str) -> str:
     return path
 
 
+async def _download_with_retry(file_id: str) -> bytes:
+    """Скачивает файл из Telegram с ретраями при сетевых ошибках.
+
+    Ретраит только `TelegramNetworkError` и `TelegramRetryAfter`.
+    Прочие исключения (например, 400-ки) пробрасываются сразу.
+    """
+    last_exc: Optional[BaseException] = None
+
+    for attempt in range(1, _DOWNLOAD_MAX_ATTEMPTS + 1):
+        try:
+            file = await bot.download(file_id)
+            if file is None:
+                raise ValueError("Telegram вернул пустой файл.")
+            return file.read()
+        except TelegramRetryAfter as exc:
+            delay = float(exc.retry_after) + 0.5
+            log.warning(
+                "Download %s: retry_after=%.1fs (attempt %d/%d)",
+                file_id, delay, attempt, _DOWNLOAD_MAX_ATTEMPTS,
+            )
+            last_exc = exc
+            if attempt < _DOWNLOAD_MAX_ATTEMPTS:
+                await asyncio.sleep(delay)
+        except TelegramNetworkError as exc:
+            delay = min(
+                _DOWNLOAD_BASE_DELAY * (2 ** (attempt - 1)),
+                _DOWNLOAD_MAX_DELAY,
+            )
+            log.warning(
+                "Download %s: network error (attempt %d/%d): %s — retry in %.1fs",
+                file_id, attempt, _DOWNLOAD_MAX_ATTEMPTS, exc, delay,
+            )
+            last_exc = exc
+            if attempt < _DOWNLOAD_MAX_ATTEMPTS:
+                await asyncio.sleep(delay)
+        except Exception:
+            # Не-сетевые ошибки (битый file_id и т.п.) нет смысла ретраить.
+            log.exception("Download %s failed (non-retryable)", file_id)
+            raise
+
+    assert last_exc is not None
+    log.error(
+        "Download %s: exhausted %d attempts — last error: %s",
+        file_id, _DOWNLOAD_MAX_ATTEMPTS, last_exc,
+    )
+    raise last_exc
+
+
 async def _download_and_encode(file_id: str, user_id: int, ext: str = "jpg") -> str:
-    file = await bot.download(file_id)
-    if file is None:
-        raise ValueError("Не удалось скачать файл из Telegram.")
-    raw = file.read()
+    raw = await _download_with_retry(file_id)
+
     if len(raw) > config.MAX_IMAGE_BYTES:
         raise ValueError(
             f"Изображение весит {_human_mb(len(raw))} — "
             f"это больше лимита {_human_mb(config.MAX_IMAGE_BYTES)}."
         )
+
     try:
         loop = asyncio.get_running_loop()
-        saved_path = await loop.run_in_executor(None, _save_photo_sync, user_id, raw, ext)
+        saved_path = await loop.run_in_executor(
+            None, _save_photo_sync, user_id, raw, ext
+        )
         log.info("Saved photo: %s", saved_path)
     except Exception:
         log.exception("Failed to save photo for user %s", user_id)
+
     return base64.b64encode(raw).decode("ascii")
+
 
 def _human_mb(n: int) -> str:
     return f"{n / 1024 / 1024:.1f} МБ"
+
+
+# ... остальное без изменений:
+#     images_from_message, images_from_album, _check_image_limits, build_content
 
 def images_from_message(msg: Message) -> List[Tuple[str, str, int, str]]:
     if msg.photo:
@@ -89,41 +146,29 @@ def images_from_album(msgs: List[Message]) -> List[Tuple[str, str, int, str]]:
 
 def _check_image_limits(items: List[Tuple[str, str, int, str]]) -> None:
     """Проверяет количество и суммарный вес картинок.
-    Кидает ValueError с понятным сообщением, если лимит нарушен."""
+
+    Лимит на количество — MAX_IMAGES_EXTENDED (жёсткий, всегда).
+    Суммарный вес набора — MAX_TOTAL_IMAGE_BYTES.
+    Вес отдельного файла проверяется в _download_and_encode
+    по MAX_IMAGE_BYTES.
+    """
     count = len(items)
     if count == 0:
         return
 
     hard = config.MAX_IMAGES_EXTENDED
-    soft = config.MAX_IMAGES
     cap = config.MAX_TOTAL_IMAGE_BYTES
-    single_cap = config.MAX_SINGLE_IMAGE_IN_EXTENDED_BYTES
 
     if count > hard:
         raise ValueError(
-            f"Слишком много изображений: {count}. "
-            f"Максимум {soft} (или {hard} при суммарном размере до {_human_mb(cap)})."
+            f"Слишком много изображений: {count}. Максимум {hard}."
         )
 
-    # ── базовый режим (≤ soft штук): per-image лимит проверится при скачивании ──
-    if count <= soft:
-        return
-
-    # ── расширенный режим (soft < count ≤ hard) — жёстче ──
     total = sum(size for _, _, size, _ in items)
     if total > cap:
         raise ValueError(
             f"{count} изображений весят {_human_mb(total)} — это больше лимита "
-            f"{_human_mb(cap)}. При таком весе можно не больше {soft} изображений."
-        )
-
-    biggest = max(size for _, _, size, _ in items)
-    if biggest > single_cap:
-        raise ValueError(
-            f"В наборе из {count} изображений есть слишком крупное "
-            f"({_human_mb(biggest)}). В режиме {soft + 1}–{hard} картинок "
-            f"каждое должно быть не больше {_human_mb(single_cap)} — "
-            f"иначе оно не оставит места остальным."
+            f"{_human_mb(cap)}."
         )
 
 async def build_content(

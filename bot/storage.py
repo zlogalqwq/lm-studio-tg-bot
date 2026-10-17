@@ -200,11 +200,12 @@ class ChatStore:
         self._response_id_history: Dict[int, List[str]] = {}         # replaces _prev_response_ids
         self._cumulative_prompt_tokens: Dict[int, int] = {}          # NEW
         self._last_user_input: Dict[int, Any] = {}
-        # Tools и Thinking всегда выключены при старте процесса.
+        # Tools выключены при старте процесса (включаются вручную
+        # через /tools on). Thinking включён по умолчанию.
         # Значения из .env (TOOLS_ENABLED / DEFAULT_THINKING) намеренно
-        # игнорируются: включить можно только вручную через /tools on, /think on.
+        # игнорируются.
         self._tools_enabled: bool = False
-        self._thinking_enabled: bool = False
+        self._thinking_enabled: bool = True
 
     # ── Thinking toggle ────────────────────────────────────────────────
     async def is_thinking_enabled(self) -> bool:

@@ -1,3 +1,4 @@
+import httpx
 import asyncio
 import json
 import logging
@@ -21,8 +22,8 @@ EMBEDDING_PREFIX = "text-embedding-"
 EMBEDDING_TYPE = "embeddings"
 
 HIDDEN_MODEL_SUBSTRINGS = ("nomic-embed", "text-embedding-")
+_CHAT_TEMPLATE_KWARGS_UNSUPPORTED: set[str] = set()
 
-# Ретраи и классификация ошибок stateful-сессии
 _STATE_RETRY_DELAY = 1.5
 _SESSION_DEAD_MARKERS = (
     "previous_response_id",
@@ -33,6 +34,26 @@ _SESSION_DEAD_MARKERS = (
     "does not exist",
     "expired",
     "invalid state",
+)
+
+# Сколько токенов LM Studio тратит на служебку сверх prompt + max_tokens.
+# Официальная рекомендация LM Studio: prompt + max_tokens + ~1500 headroom.
+_CONTEXT_HEADROOM = 1500
+_PROMPT_BUDGET_MIN = 500
+
+_TIMEOUT_HINT = (
+    "⏱ <b>LM Studio не ответил за {sec:.0f} с.</b>\n\n"
+    "Скорее всего, модель ушла в <i>thinking</i> и генерирует тысячи "
+    "токенов перед ответом. Reasoning-модели на медленном железе могут "
+    "думать минутами.\n\n"
+    "<b>Что делать:</b>\n"
+    "• <code>/maxtokens 2048</code> — ограничить длину ответа\n"
+    "• <code>/think off</code> — попробовать выключить thinking\n"
+    "• <b>В LM Studio:</b> My Models → модель → отключить "
+    "<i>Enable Thinking / Reasoning</i> (если есть)\n"
+    "• Использовать модель без reasoning\n"
+    "• Увеличить <code>LM_STUDIO_TIMEOUT</code> в <code>.env</code> "
+    "(сейчас {sec:.0f} с)"
 )
 
 
@@ -55,18 +76,21 @@ async def _animate_load_progress(header: str, status: Message, stop: asyncio.Eve
         pct = int(peak * (1 - math.exp(-elapsed / tau)))
         if pct > peak:
             pct = peak
+
+        wait_time = 0.5
         if pct != last_pct:
             try:
                 await status.edit_text(f"{header}\n{_progress_bar_text(pct)}")
             except TelegramRetryAfter as exc:
-                await asyncio.sleep(float(exc.retry_after) + 0.2)
+                wait_time = float(exc.retry_after) + 0.2
             except TelegramBadRequest as exc:
                 log.debug("Progress edit failed: %s", exc)
             except Exception as exc:
                 log.debug("Progress edit unexpected error: %s", exc)
             last_pct = pct
+
         try:
-            await asyncio.wait_for(stop.wait(), timeout=0.5)
+            await asyncio.wait_for(stop.wait(), timeout=wait_time)
         except asyncio.TimeoutError:
             pass
 
@@ -115,6 +139,89 @@ _URL_MODELS        = f"{LM_NATIVE_ROOT}/models"
 _URL_MODELS_LOAD   = f"{LM_NATIVE_ROOT}/models/load"
 _URL_MODELS_UNLOAD = f"{LM_NATIVE_ROOT}/models/unload"
 _URL_CHAT          = f"{LM_NATIVE_ROOT}/chat"
+
+
+# ─────────────────────── thinking-маркер ───────────────────────
+
+_THINKING_MARKER_ON  = "/think"
+_THINKING_MARKER_OFF = "/no_think"
+
+
+def _apply_thinking_marker(payload: Dict[str, Any], thinking_enabled: bool) -> None:
+    marker = _THINKING_MARKER_ON if thinking_enabled else _THINKING_MARKER_OFF
+    inp = payload.get("input")
+
+    if isinstance(inp, str):
+        if not inp.rstrip().endswith(marker):
+            payload["input"] = inp + " " + marker
+        return
+
+    if isinstance(inp, list):
+        for part in inp:
+            if isinstance(part, dict) and part.get("type") == "text":
+                content = part.get("content") or ""
+                if not content.rstrip().endswith(marker):
+                    part["content"] = content + " " + marker
+                return
+        inp.append({"type": "text", "content": marker})
+        return
+
+    payload["input"] = str(inp or "") + " " + marker
+
+
+async def _post_chat(
+    payload: Dict[str, Any],
+    model: str,
+    thinking_enabled: bool = True,
+) -> httpx.Response:
+    if model in _CHAT_TEMPLATE_KWARGS_UNSUPPORTED:
+        payload.pop("chat_template_kwargs", None)
+        _apply_thinking_marker(payload, thinking_enabled)
+        return await get_lm_client().post(_URL_CHAT, json=payload)
+
+    resp = await get_lm_client().post(_URL_CHAT, json=payload)
+    if (
+        resp.status_code == 400
+        and "chat_template_kwargs" in payload
+        and "chat_template_kwargs" in (resp.text or "").lower()
+    ):
+        log.warning(
+            "LM Studio rejected 'chat_template_kwargs' for model %s — "
+            "falling back to prompt marker (%s)",
+            model,
+            _THINKING_MARKER_ON if thinking_enabled else _THINKING_MARKER_OFF,
+        )
+        _CHAT_TEMPLATE_KWARGS_UNSUPPORTED.add(model)
+        payload.pop("chat_template_kwargs", None)
+        _apply_thinking_marker(payload, thinking_enabled)
+        resp = await get_lm_client().post(_URL_CHAT, json=payload)
+    return resp
+
+
+async def _send_chat_with_timeout(
+    payload: Dict[str, Any],
+    model: str,
+    thinking_enabled: bool,
+) -> httpx.Response:
+    timeout = float(config.LM_STUDIO_TIMEOUT) + 5.0
+    try:
+        return await asyncio.wait_for(
+            _post_chat(payload, model, thinking_enabled),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        log.error(
+            "Chat request hard-timeout after %.1fs (model=%s). "
+            "Likely a reasoning model ignoring /no_think.",
+            timeout, model,
+        )
+        raise RuntimeError(_TIMEOUT_HINT.format(sec=config.LM_STUDIO_TIMEOUT))
+    except httpx.TimeoutException as exc:
+        log.error(
+            "Chat request httpx-timeout after %.1fs (model=%s): %s",
+            timeout, model, exc,
+        )
+        raise RuntimeError(_TIMEOUT_HINT.format(sec=config.LM_STUDIO_TIMEOUT))
 
 
 # ─────────────────────── список моделей ───────────────────────
@@ -309,7 +416,6 @@ def _estimate_tokens(messages: List[Dict[str, Any]]) -> int:
 
 
 def estimate_context_tokens(history: List[Dict[str, Any]]) -> int:
-    """Публичная обёртка: оценка размера контекста в токенах."""
     return _estimate_tokens(history)
 
 
@@ -364,26 +470,19 @@ def _extract_text_for_history(content: Any) -> str:
 def _build_history_input(
     history: List[Dict[str, Any]],
     current_native_input: Any,
-    max_context_tokens: int = 0,
+    prompt_budget: int = 0,
 ) -> Any:
-    """Собирает префикс из прошлых сообщений + текущий input в один запрос.
+    """Собирает префикс из истории + текущий input.
 
-    Используется, когда:
-      * stateful-сессия умерла и её надо восстановить;
-      * начинается fresh-сессия, но у пользователя уже есть история
-        (после /system, /load и т.п.).
-
-    System-сообщения пропускаются: system_prompt отправляется отдельным
-    полем payload["system_prompt"].
-
-    Если задан max_context_tokens, старые сообщения обрезаются так,
-    чтобы вписаться в ~70% лимита (остальное — запас на ответ).
+    prompt_budget — СКОЛЬКО ТОКЕНОВ ДОСТУПНО НА ВЕСЬ ПРОМПТ
+    (история + текущее сообщение), уже за вычетом max_tokens и headroom.
+    Если 0 — не обрезаем.
     """
-    # ── обрезка по бюджету ──
-    if max_context_tokens > 0 and history:
-        budget = int(max_context_tokens * 0.7)
-        cur_tokens = _estimate_tokens([{"role": "user", "content": current_native_input}])
-        budget -= cur_tokens
+    if prompt_budget > 0 and history:
+        cur_tokens = _estimate_tokens(
+            [{"role": "user", "content": current_native_input}]
+        )
+        budget = prompt_budget - cur_tokens
         if budget < 0:
             budget = 0
         trimmed: List[Dict[str, Any]] = []
@@ -425,6 +524,49 @@ def _build_history_input(
     return prefix + str(current_native_input)
 
 
+# ─────────────────────── context-budget check ───────────────────────
+
+def _check_context_fits(
+    payload: Dict[str, Any],
+    max_tokens: int,
+    actual_ctx: int,
+    prev_prompt_tokens: int = 0,
+) -> int:
+    """Проверяет, что запрос помещается в контекст LM Studio.
+
+    Возвращает оценку размера промпта в токенах (для логов).
+    Бросает RuntimeError с готовой инструкцией при переполнении —
+    это лучше, чем «stall на 0.66%» в GUI LM Studio.
+    """
+    input_est = _estimate_tokens([{"role": "user", "content": payload["input"]}])
+    sp = payload.get("system_prompt") or ""
+    sp_est = _estimate_tokens([{"role": "system", "content": sp}]) if sp else 0
+
+    if prev_prompt_tokens > 0 and "previous_response_id" in payload:
+        # Stateful: сервер уже держит систему + предыдущий контекст.
+        total = prev_prompt_tokens + input_est + max_tokens
+    else:
+        # Fresh: считаем полный объём того, что отправляем.
+        total = input_est + sp_est + max_tokens
+
+    if actual_ctx > 0 and total > actual_ctx:
+        raise RuntimeError(
+            f"⚠️ <b>Запрос не влезает в контекст LM Studio.</b>\n\n"
+            f"Нужно: <b>~{total}</b> токенов\n"
+            f"  • промпт (история + сообщение): ~{input_est}\n"
+            f"  • system prompt: ~{sp_est}\n"
+            f"  • ответ (max_tokens): {max_tokens}\n"
+            f"Доступно в контексте: <b>{actual_ctx}</b>\n\n"
+            f"<b>Что сделать:</b>\n"
+            f"• <code>/maxtokens 2048</code> — уменьшить бюджет ответа\n"
+            f"• <code>/clean</code> — начать новый диалог\n"
+            f"• В LM Studio: Context Length → <b>{total + _CONTEXT_HEADROOM}</b> "
+            f"или больше"
+        )
+
+    return input_est + sp_est
+
+
 # ─────────────────────── chat_completion: NATIVE API ───────────────────────
 
 async def chat_completion(
@@ -438,27 +580,35 @@ async def chat_completion(
     use_tools: bool = True,
     thinking_enabled: bool = True,
     history_context: Optional[List[Dict[str, Any]]] = None,
+    loaded_context_length: int = 0,
+    prev_prompt_tokens: int = 0,
 ) -> tuple[str, Optional[Dict[str, int]], float, Optional[str], bool]:
     """Native /api/v1/chat со stateful-режимом.
 
     Возвращает (reply, usage, elapsed, response_id, session_reset).
-    * usage is None  →  генерация прервана пользователем.
-    * session_reset  →  сессия была сброшена (stateful-контекст потерян).
 
-    Особенности:
-    * system_prompt отправляется отдельным полем ТОЛЬКО при старте
-      новой сессии (или после session_reset).
-    * thinking_enabled=False → добавляет chat_template_kwargs.enable_thinking=False
-      (Qwen3 и другие reasoning-модели; для остальных моделей LM Studio
-      просто проигнорирует этот ключ).
-    * history_context — история на случай восстановления после падения
-      stateful-сессии или старта fresh-сессии с сохранённой историей.
+    loaded_context_length — фактический контекст из store.get_loaded_context_length().
+    prev_prompt_tokens     — store.get_cumulative_tokens(user_id) — сколько
+                              сервер уже накопил в stateful-сессии.
     """
     temperature = getattr(settings, "temperature", config.DEFAULT_TEMPERATURE) if settings else config.DEFAULT_TEMPERATURE
     top_k       = getattr(settings, "top_k",       config.DEFAULT_TOP_K)       if settings else config.DEFAULT_TOP_K
     top_p       = getattr(settings, "top_p",       config.DEFAULT_TOP_P)       if settings else config.DEFAULT_TOP_P
     max_tokens  = getattr(settings, "max_tokens",  config.DEFAULT_MAX_TOKENS)  if settings else config.DEFAULT_MAX_TOKENS
-    ctx_limit   = getattr(settings, "context_limit", config.DEFAULT_CONTEXT_LIMIT) if settings else config.DEFAULT_CONTEXT_LIMIT
+    user_ctx    = getattr(settings, "context_limit", config.DEFAULT_CONTEXT_LIMIT) if settings else config.DEFAULT_CONTEXT_LIMIT
+
+    # ── фактический лимит: min(loaded, user) или что есть ──
+    actual_ctx = int(loaded_context_length or 0)
+    if user_ctx > 0:
+        actual_ctx = min(actual_ctx, user_ctx) if actual_ctx > 0 else user_ctx
+
+    # ── бюджет под промпт (история + текущее + system) ──
+    if actual_ctx > 0:
+        prompt_budget = actual_ctx - max_tokens - _CONTEXT_HEADROOM
+        if prompt_budget < _PROMPT_BUDGET_MIN:
+            prompt_budget = _PROMPT_BUDGET_MIN
+    else:
+        prompt_budget = 0  # неизвестно — не обрезаем
 
     # ── анимация ожидания ──
     thinking_stop = asyncio.Event()
@@ -474,7 +624,6 @@ async def chat_completion(
             log.debug("thinking animator crashed", exc_info=True)
 
     start_time = time.monotonic()
-
     native_input = _to_native_input(message)
 
     payload: Dict[str, Any] = {
@@ -484,28 +633,26 @@ async def chat_completion(
         "top_p": top_p,
         "top_k": top_k,
         "max_output_tokens": max_tokens,
+        "stream": False,
     }
 
-    # System prompt — только в новой сессии.
     if not previous_response_id and system_prompt.strip():
         payload["system_prompt"] = system_prompt.strip()
 
     if previous_response_id:
         payload["previous_response_id"] = previous_response_id
 
-    # Если стартуем fresh-сессию, но есть история — префиксуем её.
-    # Это спасает контекст после /system, /load, /reload.
     if not previous_response_id and history_context:
         payload["input"] = _build_history_input(
-            history_context, native_input, max_context_tokens=ctx_limit,
+            history_context, native_input, prompt_budget=prompt_budget,
         )
         log.info(
-            "Fresh session with history: %d prior message(s) prepended",
-            len(history_context),
+            "Fresh session with history: %d prior message(s) prepended, "
+            "prompt_budget=%d",
+            len(history_context), prompt_budget,
         )
 
-    # Thinking toggle (Qwen3 / reasoning модели через chat template).
-    if not thinking_enabled:
+    if not thinking_enabled and model not in _CHAT_TEMPLATE_KWARGS_UNSUPPORTED:
         payload.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
 
     if use_tools:
@@ -524,18 +671,37 @@ async def chat_completion(
     )
     log.info(
         "Native request: system_prompt=%s (%d chars), prev_id=%s, "
-        "integrations=%s, thinking=%s, input_type=%s",
+        "integrations=%s, thinking=%s, input_type=%s, "
+        "actual_ctx=%d, max_tokens=%d, prompt_budget=%d",
         sp_state, len(sp),
         (previous_response_id[:8] + "…") if previous_response_id else None,
         len(payload.get("integrations") or []),
         "on" if thinking_enabled else "off",
         type(payload["input"]).__name__,
+        actual_ctx, max_tokens, prompt_budget,
     )
+
+    # ── ПРОВЕРКА КОНТЕКСТА ДО ОТПРАВКИ ──
+    # Это ловит главную причину stall'а на 0.66%:
+    # prompt + max_tokens > context_length → LM Studio виснет на префилле.
+    try:
+        estimated_prompt = _check_context_fits(
+            payload,
+            max_tokens=max_tokens,
+            actual_ctx=actual_ctx,
+            prev_prompt_tokens=prev_prompt_tokens,
+        )
+        log.info("Context check OK: prompt≈%d + max_tokens=%d <= ctx=%d",
+                 estimated_prompt, max_tokens, actual_ctx)
+    except RuntimeError:
+        await _stop_thinking()
+        raise
+
     log.debug("Native payload: %s", json.dumps(payload, ensure_ascii=False)[:1500])
 
-    # ── отправка с поддержкой stop_event ──
+    # ── отправка ──
     request_task: asyncio.Future = asyncio.ensure_future(
-        get_lm_client().post(_URL_CHAT, json=payload)
+        _send_chat_with_timeout(payload, model, thinking_enabled)
     )
     stopped = False
     stop_task: Optional[asyncio.Future] = None
@@ -571,27 +737,23 @@ async def chat_completion(
         return "", None, elapsed, None, False
 
     resp = request_task.result()
-
-    # ── классификация ошибок stateful-сессии ──
     session_reset = False
 
     if resp.status_code != 200:
         status_code = resp.status_code
         body_lower = (resp.text or "").lower()
 
-        # Класс 2: транзиентная — ретрай с сохранением сессии.
         if status_code in (408, 429) or status_code >= 500:
             log.warning(
                 "Transient HTTP %s — retry with session intact in %.1fs",
                 status_code, _STATE_RETRY_DELAY,
             )
             await asyncio.sleep(_STATE_RETRY_DELAY)
-            resp = await get_lm_client().post(_URL_CHAT, json=payload)
+            resp = await _send_chat_with_timeout(payload, model, thinking_enabled)
             status_code = resp.status_code
             body_lower = (resp.text or "").lower()
 
         if previous_response_id:
-            # Класс 1: сессия мертва.
             session_dead = status_code in (404, 410) or (
                 status_code == 400
                 and any(m in body_lower for m in _SESSION_DEAD_MARKERS)
@@ -609,9 +771,16 @@ async def chat_completion(
                 if history_context:
                     payload["input"] = _build_history_input(
                         history_context, native_input,
-                        max_context_tokens=ctx_limit,
+                        prompt_budget=prompt_budget,
                     )
-                resp = await get_lm_client().post(_URL_CHAT, json=payload)
+                # Пере-проверка после пересборки промпта.
+                _check_context_fits(
+                    payload,
+                    max_tokens=max_tokens,
+                    actual_ctx=actual_ctx,
+                    prev_prompt_tokens=0,  # fresh session
+                )
+                resp = await _send_chat_with_timeout(payload, model, thinking_enabled)
                 session_reset = True
             else:
                 log.warning(
@@ -636,12 +805,16 @@ async def chat_completion(
     }
     output = data.get("output") or []
     reply_parts: List[str] = []
+    reasoning_chars = 0
     if isinstance(output, list):
         for item in output:
             if not isinstance(item, dict):
                 continue
             itype = (item.get("type") or "").lower()
             if itype in _SKIP_OUTPUT_TYPES:
+                c = item.get("content") or item.get("text") or ""
+                if isinstance(c, str):
+                    reasoning_chars += len(c)
                 continue
             if itype == "tool_call":
                 tool_name = item.get("tool") or item.get("name")
@@ -702,12 +875,29 @@ async def chat_completion(
         source = "estimate"
 
     log.info(
-        "Request done: chars=%d elapsed=%.2fs usage_source=%s "
+        "Request done: chars=%d reasoning=%d elapsed=%.2fs usage_source=%s "
         "prompt=%d completion=%d total=%d response_id=%s session_reset=%s",
-        len(reply), elapsed, source,
+        len(reply), reasoning_chars, elapsed, source,
         usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"],
         response_id, session_reset,
     )
+
+    # Диагностика: модель потратила всё на reasoning, но ответа нет.
+    if not reply and reasoning_chars > 0:
+        log.warning(
+            "Model produced %d chars of reasoning but no reply. "
+            "Likely hit max_output_tokens during thinking "
+            "(completion_tokens=%d, max_tokens=%d).",
+            reasoning_chars, completion_tokens, max_tokens,
+        )
+        reply = (
+            "⚠️ Модель потратила все токены на reasoning "
+            f"({reasoning_chars} символов размышлений) и не успела ответить.\n\n"
+            f"Попробуйте:\n"
+            f"• <code>/maxtokens 4096</code> — увеличить бюджет\n"
+            f"• <code>/think off</code> — выключить thinking\n"
+            f"• Использовать модель без reasoning"
+        )
 
     return reply, usage, elapsed, response_id, session_reset
 
@@ -720,53 +910,25 @@ _THINKING_EMOJIS = (
 )
 
 _THINKING_VERBS = (
-    "Генерирую",
-    "Думаю",
-    "Размышляю",
-    "Соображаю",
-    "Считаю токены",
-    "Ворожу",
-    "Собираю мысли",
-    "Творю",
-    "Кручу шестерёнки",
-    "Советуюсь с моделью",
-    "Ищу ответ",
-    "Пишу",
+    "Генерирую", "Думаю", "Размышляю", "Соображаю",
+    "Считаю токены", "Ворожу", "Собираю мысли", "Творю",
+    "Кручу шестерёнки", "Советуюсь с моделью", "Ищу ответ", "Пишу",
 )
 
-# Короткие «хвосты», которые цепляются к глаголу.
 _THINKING_TAILS = (
-    "…",
-    "… почти",
-    "… ещё чуть-чуть",
-    "… уже близко",
-    "… без паники",
-    "… не спеша",
-    "… со вкусом",
-    "… вдумчиво",
-    "… на максималках",
-    "… по классике",
-    "… аккуратно",
-    "… в фоне",
-    "… без лишнего шума",
-    "… и немного магии",
+    "…", "… почти", "… ещё чуть-чуть", "… уже близко",
+    "… без паники", "… не спеша", "… со вкусом", "… вдумчиво",
+    "… на максималках", "… по классике", "… аккуратно",
+    "… в фоне", "… без лишнего шума", "… и немного магии",
     "… как следует",
 )
 
-# «Акценты» — редкая вторая строка, добавляет живости.
 _THINKING_ACCENTS = (
-    "🫧 токены летят",
-    "🎼 подбираю рифму",
-    "🍵 завариваю ответ",
-    "🧩 складываю пазл",
-    "🛠 подкручиваю гайки",
-    "🎲 бросаю кубики",
-    "🪄 колдую над промптом",
-    "📚 листаю контекст",
-    "🌊 синхронизируюсь с сервером",
-    "🛰 жду пакет с ответом",
-    "🐢 медленно, но верно",
-    "🦾 держу удар",
+    "🫧 токены летят", "🎼 подбираю рифму", "🍵 завариваю ответ",
+    "🧩 складываю пазл", "🛠 подкручиваю гайки", "🎲 бросаю кубики",
+    "🪄 колдую над промптом", "📚 листаю контекст",
+    "🌊 синхронизируюсь с сервером", "🛰 жду пакет с ответом",
+    "🐢 медленно, но верно", "🦾 держу удар",
 )
 
 _THINKING_MIN_INTERVAL = 0.9
@@ -775,7 +937,6 @@ _THINKING_ACCENT_CHANCE = 0.35
 
 
 def _pick_tail(prev: Optional[str]) -> str:
-    """Случайный хвост, не совпадающий с предыдущим (чтобы не залипало)."""
     if prev is None or len(_THINKING_TAILS) <= 1:
         return random.choice(_THINKING_TAILS)
     tail = random.choice(_THINKING_TAILS)
@@ -784,27 +945,32 @@ def _pick_tail(prev: Optional[str]) -> str:
     return tail
 
 
-def _render_thinking_frame(tick: int, tail: str) -> str:
+def _render_thinking_frame(tick: int, tail: str, elapsed: float) -> str:
     emoji = _THINKING_EMOJIS[tick % len(_THINKING_EMOJIS)]
     verb = _THINKING_VERBS[tick % len(_THINKING_VERBS)]
 
     frame = f"{emoji} {verb}{tail}"
     if random.random() < _THINKING_ACCENT_CHANCE:
         frame += "\n<i>" + random.choice(_THINKING_ACCENTS) + "</i>"
+    if elapsed > 20:
+        frame += f"\n<i>⏱ {int(elapsed)} с…</i>"
     return frame
 
 
 async def _animate_thinking(status: Message, stop: asyncio.Event) -> None:
+    anim_start = time.monotonic()
     tick = 0
     prev_tail: Optional[str] = None
     while not stop.is_set():
         prev_tail = _pick_tail(prev_tail)
-        frame = _render_thinking_frame(tick, prev_tail)
+        elapsed = time.monotonic() - anim_start
+        frame = _render_thinking_frame(tick, prev_tail, elapsed)
 
+        wait_time = random.uniform(_THINKING_MIN_INTERVAL, _THINKING_MAX_INTERVAL)
         try:
             await status.edit_text(frame, reply_markup=stop_keyboard())
         except TelegramRetryAfter as exc:
-            await asyncio.sleep(float(exc.retry_after) + 0.2)
+            wait_time = float(exc.retry_after) + 0.2
         except TelegramBadRequest:
             pass
         except Exception:
@@ -812,12 +978,7 @@ async def _animate_thinking(status: Message, stop: asyncio.Event) -> None:
 
         tick += 1
         try:
-            await asyncio.wait_for(
-                stop.wait(),
-                timeout=random.uniform(
-                    _THINKING_MIN_INTERVAL, _THINKING_MAX_INTERVAL
-                ),
-            )
+            await asyncio.wait_for(stop.wait(), timeout=wait_time)
         except asyncio.TimeoutError:
             pass
 
