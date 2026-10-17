@@ -95,15 +95,17 @@ def context_bar(used: int, total: int, width: int = 10) -> str:
 
 
 # ─────────────────── Красивая статистика после ответа ───────────────────
-def render_stats(usage, elapsed, settings=None, loaded_ctx=0):
+def render_stats(usage, elapsed, settings=None, loaded_ctx=0, used_tokens=None):
     if settings is None:
         return ""
-    used = int(usage.get("prompt_tokens", 0) or 0)
+    if used_tokens is not None:
+        used = int(used_tokens)
+    else:
+        used = int(usage.get("prompt_tokens", 0) or 0)
     limit = loaded_ctx or getattr(settings, "context_limit", 0) or 0
     if limit <= 0 or used <= 0:
         return ""
     return "\n\n📚 " + context_bar(used, limit)
-    
 
 # ─────────────────── Случайные футеры-подсказки ───────────────────
 

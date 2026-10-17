@@ -19,11 +19,13 @@ def _password_fingerprint(password: str) -> str:
 
 CURRENT_FINGERPRINT: str = _password_fingerprint(config.AUTH_PASSWORD)
 
+
 class UserSettings:
     """Персональные настройки генерации для пользователя."""
     __slots__ = (
         "temperature", "top_k", "top_p", "context_limit", "max_tokens",
         "last_prompt_tokens", "last_completion_tokens", "last_total_tokens",
+        "last_effective_tokens", "context_warned",
     )
 
     def __init__(self) -> None:
@@ -35,24 +37,24 @@ class UserSettings:
         self.last_prompt_tokens: int = 0
         self.last_completion_tokens: int = 0
         self.last_total_tokens: int = 0
+        self.last_effective_tokens: int = 0
+        self.context_warned: bool = False
 
     @property
     def usage_ratio(self) -> float:
         if self.context_limit <= 0:
             return 0.0
-        return self.last_total_tokens / self.context_limit
+        return self.last_effective_tokens / self.context_limit
 
     def reset_usage(self) -> None:
-        """Сброс последнего запроса."""
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
+        self.last_effective_tokens = 0
+        self.context_warned = False
 
     def reset_last_usage(self) -> None:
-        """Сброс только последнего запроса (оставлено для совместимости)."""
-        self.last_prompt_tokens = 0
-        self.last_completion_tokens = 0
-        self.last_total_tokens = 0
+        self.reset_usage()
 
 
 def _load_authorized() -> Set[int]:
@@ -82,6 +84,7 @@ def _save_authorized(users: Set[int]) -> None:
             json.dump(payload, f, ensure_ascii=False, indent=2)
     except Exception:
         log.exception("Failed to save authorized users to %s", config.AUTH_FILE)
+
 
 def _load_system_prompts() -> Dict[int, str]:
     try:
@@ -113,6 +116,7 @@ def _save_system_prompts(prompts: Dict[int, str]) -> None:
     except Exception:
         log.exception("Failed to save system prompts to %s", config.SYSTEM_PROMPT_FILE)
 
+
 def _load_summaries() -> Dict[int, str]:
     try:
         if not os.path.exists(config.SUMMARY_FILE):
@@ -134,6 +138,7 @@ def _save_summaries(summaries: Dict[int, str]) -> None:
             json.dump(payload, f, ensure_ascii=False, indent=2)
     except Exception:
         log.exception("Failed to save summaries to %s", config.SUMMARY_FILE)
+
 
 def _load_tracked() -> Dict[int, List[Tuple[int, int]]]:
     try:
@@ -189,86 +194,120 @@ class ChatStore:
         self._admin_sessions: Dict[int, float] = {}
         self._last_message_ts: Dict[Tuple[str, int], float] = {}
         self._system_prompts: Dict[int, str] = _load_system_prompts()
-        self._summaries: Dict[int, str] = _load_summaries()
+        self._summaries: Dict[int, str] = _load_summaries()          # FIX: was missing
         self._loaded_context_length: int = 0
         self._response_ids: Dict[int, str] = {}
-        self._prev_response_ids: Dict[int, str] = {}
+        self._response_id_history: Dict[int, List[str]] = {}         # replaces _prev_response_ids
+        self._cumulative_prompt_tokens: Dict[int, int] = {}          # NEW
         self._last_user_input: Dict[int, Any] = {}
-        self._tools_enabled: bool = config.TOOLS_ENABLED_BY_DEFAULT
+        # Tools и Thinking всегда выключены при старте процесса.
+        # Значения из .env (TOOLS_ENABLED / DEFAULT_THINKING) намеренно
+        # игнорируются: включить можно только вручную через /tools on, /think on.
+        self._tools_enabled: bool = False
+        self._thinking_enabled: bool = False
 
+    # ── Thinking toggle ────────────────────────────────────────────────
+    async def is_thinking_enabled(self) -> bool:
+        async with self._lock:
+            return self._thinking_enabled
+
+    async def set_thinking_enabled(self, enabled: bool) -> None:
+        async with self._lock:
+            self._thinking_enabled = bool(enabled)
+
+    # ── Tools toggle (MCP) ────────────────────────────────────────────
     async def is_tools_enabled(self) -> bool:
         async with self._lock:
             return self._tools_enabled
 
     async def set_tools_enabled(self, enabled: bool) -> None:
         async with self._lock:
-            self._tools_enabled = enabled
+            self._tools_enabled = bool(enabled)
 
-    # --- Stateful-чаты: response_id для нативного API LM Studio ---
+    # ── Cumulative tokens (для корректного бара контекста) ────────────
+    async def update_cumulative_tokens(self, user_id: int, prompt_tokens: int) -> int:
+        """Учитывает API prompt_tokens с эвристикой delta vs total.
+
+        * delta (LM Studio вернул только прирост) → складываем;
+        * total (LM Studio вернул суммарный размер сессии) → заменяем.
+        """
+        async with self._lock:
+            prev = self._cumulative_prompt_tokens.get(user_id, 0)
+            pt = int(prompt_tokens or 0)
+            if pt <= 0:
+                return prev
+            if prev == 0:
+                new = pt
+            elif pt < int(prev * 0.95):
+                new = prev + pt
+            else:
+                new = pt
+            self._cumulative_prompt_tokens[user_id] = new
+            return new
+
+    async def get_cumulative_tokens(self, user_id: int) -> int:
+        async with self._lock:
+            return self._cumulative_prompt_tokens.get(user_id, 0)
+
+    async def reset_cumulative_tokens(self, user_id: int) -> None:
+        async with self._lock:
+            self._cumulative_prompt_tokens.pop(user_id, None)
+
+    # ── Stateful-чаты: response_id stack ──────────────────────────────
     async def get_response_id(self, user_id: int) -> Optional[str]:
         async with self._lock:
             return self._response_ids.get(user_id)
 
-    async def set_response_id(
-        self, user_id: int, new_id: Optional[str]
-    ) -> None:
-        """Записать новый response_id. Предыдущий автоматически становится parent."""
+    async def set_response_id(self, user_id: int, new_id: Optional[str]) -> None:
         async with self._lock:
-            old = self._response_ids.get(user_id)
-            if old:
-                self._prev_response_ids[user_id] = old
             if new_id:
+                stack = self._response_id_history.setdefault(user_id, [])
+                if not stack or stack[-1] != new_id:
+                    stack.append(new_id)
                 self._response_ids[user_id] = new_id
             else:
                 self._response_ids.pop(user_id, None)
 
     async def rollback_response_id(self, user_id: int) -> None:
-        """Откатить состояние на один шаг назад (для /regenerate)."""
         async with self._lock:
-            prev = self._prev_response_ids.get(user_id)
-            if prev:
-                self._response_ids[user_id] = prev
+            stack = self._response_id_history.get(user_id, [])
+            if stack:
+                stack.pop()
+            if stack:
+                self._response_ids[user_id] = stack[-1]
             else:
                 self._response_ids.pop(user_id, None)
+                self._response_id_history.pop(user_id, None)
 
     async def reset_api_state(self, user_id: int) -> None:
-        """Сбросить stateful-сессию LM Studio, НЕ трогая локальную историю.
-
-        Нужен, когда меняется системный промпт или резюме: при stateful-режиме
-        с previous_response_id новый системный промпт иначе не долетит до
-        модели — она продолжит прежнюю цепочку.
-        """
         async with self._lock:
             self._response_ids.pop(user_id, None)
-            self._prev_response_ids.pop(user_id, None)
+            self._response_id_history.pop(user_id, None)
 
     async def reset_all_api_states(self) -> int:
-        """Сбросить stateful-сессии LM Studio у всех пользователей.
-
-        Нужен при операциях с моделью (load / unload / reload): LM Studio
-        теряет свой внутренний state, а старые response_id становятся
-        невалидными или, что хуже, продолжают указывать на сессию без
-        system-промпта. Возвращает число сброшенных сессий.
-        """
         async with self._lock:
             n = len(self._response_ids)
             self._response_ids.clear()
-            self._prev_response_ids.clear()
+            self._response_id_history.clear()
+            self._cumulative_prompt_tokens.clear()
         return n
-                
+
+    # ── Очистка ───────────────────────────────────────────────────────
     async def clear(self, user_id: int) -> None:
         async with self._lock:
             self._history.pop(user_id, None)
             self._response_ids.pop(user_id, None)
-            self._prev_response_ids.pop(user_id, None)
+            self._response_id_history.pop(user_id, None)
+            self._cumulative_prompt_tokens.pop(user_id, None)
             self._last_user_input.pop(user_id, None)
-            self._summaries.pop(user_id, None)
-            _save_summaries(self._summaries)
             s = self._settings.get(user_id)
             if s:
                 s.reset_usage()
 
-    # --- Резюме диалога ---
+    async def reset_context(self, user_id: int) -> None:
+        await self.clear(user_id)
+
+    # ── Резюме ────────────────────────────────────────────────────────
     async def get_summary(self, user_id: int) -> str:
         async with self._lock:
             return self._summaries.get(user_id, "")
@@ -287,17 +326,7 @@ class ChatStore:
             self._summaries.pop(user_id, None)
             _save_summaries(self._summaries)
 
-    async def reset_context(self, user_id: int) -> None:
-        """Сбросить историю и stateful-состояние, НЕ трогая резюме и настройки."""
-        async with self._lock:
-            self._history.pop(user_id, None)
-            self._response_ids.pop(user_id, None)
-            self._prev_response_ids.pop(user_id, None)
-            self._last_user_input.pop(user_id, None)
-            s = self._settings.get(user_id)
-            if s:
-                s.reset_usage()
-
+    # ── Last user input ───────────────────────────────────────────────
     async def get_last_user_input(self, user_id: int) -> Optional[Any]:
         async with self._lock:
             return self._last_user_input.get(user_id)
@@ -306,10 +335,10 @@ class ChatStore:
         async with self._lock:
             self._last_user_input[user_id] = content
 
+    # ── Cooldown ──────────────────────────────────────────────────────
     async def check_cooldown(
         self, user_id: int, cooldown: float, bucket: str = "msg"
-) -> float:
-        """Вернуть оставшиеся секунды, если ещё рано. 0 — можно."""
+    ) -> float:
         if cooldown <= 0:
             return 0.0
         async with self._lock:
@@ -322,7 +351,7 @@ class ChatStore:
             self._last_message_ts[key] = now
             return 0.0
 
-    # --- Админ-сессии ---
+    # ── Админ-сессии ──────────────────────────────────────────────────
     async def grant_admin(self, user_id: int, ttl: float) -> None:
         async with self._lock:
             self._admin_sessions[user_id] = time.monotonic() + ttl
@@ -342,7 +371,6 @@ class ChatStore:
             self._admin_sessions.pop(user_id, None)
 
     async def admin_ttl_left(self, user_id: int) -> int:
-        """Сколько секунд осталось до конца админ-сессии (0 если нет)."""
         async with self._lock:
             exp = self._admin_sessions.get(user_id)
             if exp is None:
@@ -353,7 +381,7 @@ class ChatStore:
                 return 0
             return left
 
-    # --- Настройки пользователя ---
+    # ── Настройки ─────────────────────────────────────────────────────
     async def get_settings(self, user_id: int) -> UserSettings:
         async with self._lock:
             return self._settings.setdefault(user_id, UserSettings())
@@ -366,7 +394,6 @@ class ChatStore:
                     setattr(s, k, v)
             return s
 
-    # --- Реальный context_length активной модели ---
     async def set_loaded_context_length(self, n: int) -> None:
         async with self._lock:
             self._loaded_context_length = int(n) if n and n > 0 else 0
@@ -387,15 +414,17 @@ class ChatStore:
         prompt_tokens: int,
         completion_tokens: int,
         total_tokens: int,
+        effective_tokens: Optional[int] = None,
     ) -> None:
         async with self._lock:
             s = self._settings.setdefault(user_id, UserSettings())
             s.last_prompt_tokens = prompt_tokens
             s.last_completion_tokens = completion_tokens
             s.last_total_tokens = total_tokens
+            if effective_tokens is not None:
+                s.last_effective_tokens = int(effective_tokens)
 
     async def trim_history(self, user_id: int, keep_last: int) -> int:
-        """Оставить только последние keep_last сообщений. Вернуть сколько удалено."""
         async with self._lock:
             msgs = self._history.get(user_id)
             if not msgs:
@@ -405,10 +434,10 @@ class ChatStore:
             self._history[user_id] = msgs[-keep_last:] if keep_last else []
             s = self._settings.get(user_id)
             if s:
-                s.reset_last_usage()   # ← было reset_usage()
+                s.reset_last_usage()
             return removed
-        
-            # --- Системный промпт ---
+
+    # ── Системный промпт ──────────────────────────────────────────────
     async def get_system_prompt(self, user_id: int) -> str:
         async with self._lock:
             return self._system_prompts.get(user_id, "")
@@ -428,7 +457,6 @@ class ChatStore:
             _save_system_prompts(self._system_prompts)
 
     async def get_with_system(self, user_id: int) -> List[Dict[str, Any]]:
-        """История + системный промпт (если задан) — для передачи в API."""
         async with self._lock:
             msgs = list(self._history.setdefault(user_id, []))
             sp = (self._system_prompts.get(user_id) or "").strip()
@@ -436,19 +464,23 @@ class ChatStore:
                 return [{"role": "system", "content": sp}, *msgs]
             return msgs
 
-    # --- История ---
+    # ── История ───────────────────────────────────────────────────────
     async def get(self, user_id: int) -> List[Dict[str, Any]]:
         async with self._lock:
             return list(self._history.setdefault(user_id, []))
 
     async def append_user(self, user_id: int, content: Any) -> None:
         async with self._lock:
-            self._history.setdefault(user_id, []).append({"role": "user", "content": content})
+            self._history.setdefault(user_id, []).append(
+                {"role": "user", "content": content}
+            )
             self._trim(user_id)
 
     async def append_assistant(self, user_id: int, content: str) -> None:
         async with self._lock:
-            self._history.setdefault(user_id, []).append({"role": "assistant", "content": content})
+            self._history.setdefault(user_id, []).append(
+                {"role": "assistant", "content": content}
+            )
             self._trim(user_id)
 
     async def drop_last_assistant(self, user_id: int) -> bool:
@@ -466,7 +498,7 @@ class ChatStore:
             tail = msgs[-(self._max_turns * 2):]
             self._history[user_id] = [first, *tail] if first else tail
 
-    # --- Трекинг сообщений ---
+    # ── Трекинг сообщений ─────────────────────────────────────────────
     async def track_message(self, user_id: int, chat_id: int, message_id: int) -> None:
         async with self._lock:
             self._messages.setdefault(user_id, []).append((chat_id, message_id))
@@ -479,7 +511,18 @@ class ChatStore:
                 _save_tracked(self._messages)
             return pairs
 
-    # --- Кэш моделей ---
+    async def untrack_message(self, user_id: int, chat_id: int, message_id: int) -> None:
+        async with self._lock:
+            pairs = self._messages.get(user_id)
+            if not pairs:
+                return
+            try:
+                pairs.remove((chat_id, message_id))
+            except ValueError:
+                return
+            _save_tracked(self._messages)
+
+    # ── Кэш моделей ───────────────────────────────────────────────────
     @property
     def models_expired(self) -> bool:
         return time.monotonic() > self._cache_expires
@@ -491,9 +534,8 @@ class ChatStore:
         self._cached_models = models
         self._cache_expires = time.monotonic() + ttl
 
-    # --- Busy (per-user) ---
+    # ── Busy (per-user) ───────────────────────────────────────────────
     async def try_acquire(self, user_id: int) -> bool:
-        """Попытаться занять пользователя. True — если был свободен и стал занят."""
         async with self._lock:
             if user_id in self._busy:
                 return False
@@ -501,7 +543,6 @@ class ChatStore:
             return True
 
     async def release(self, user_id: int) -> None:
-        """Освободить пользователя."""
         async with self._lock:
             self._busy.discard(user_id)
 
@@ -509,7 +550,7 @@ class ChatStore:
         async with self._lock:
             return user_id in self._busy
 
-    # --- Busy (model op, глобально) ---
+    # ── Busy (model op, глобально) ────────────────────────────────────
     async def try_acquire_model_op(self) -> bool:
         async with self._lock:
             if self._model_op_busy:
@@ -525,7 +566,7 @@ class ChatStore:
         async with self._lock:
             return self._model_op_busy
 
-    # --- Авторизация ---
+    # ── Авторизация ───────────────────────────────────────────────────
     async def is_authorized(self, user_id: int) -> bool:
         async with self._lock:
             return user_id in self._authorized
@@ -545,7 +586,7 @@ class ChatStore:
                 _save_authorized(self._authorized)
         log.info("User %s revoked", user_id)
 
-    # --- Остановка генерации ---
+    # ── Остановка генерации ───────────────────────────────────────────
     async def start_generation(self, user_id: int) -> asyncio.Event:
         async with self._lock:
             ev = asyncio.Event()
@@ -563,17 +604,6 @@ class ChatStore:
                 return False
             ev.set()
             return True
-    async def untrack_message(self, user_id: int, chat_id: int, message_id: int) -> None:
-        """Убрать сообщение из трекера (например, если оно уже удалено)."""
-        async with self._lock:
-            pairs = self._messages.get(user_id)
-            if not pairs:
-                return
-            try:
-                pairs.remove((chat_id, message_id))
-            except ValueError:
-                return
-            _save_tracked(self._messages)
 
 
 store = ChatStore(max_turns=config.MAX_HISTORY_TURNS)

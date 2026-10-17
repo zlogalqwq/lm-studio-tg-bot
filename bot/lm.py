@@ -22,6 +22,19 @@ EMBEDDING_TYPE = "embeddings"
 
 HIDDEN_MODEL_SUBSTRINGS = ("nomic-embed", "text-embedding-")
 
+# Ретраи и классификация ошибок stateful-сессии
+_STATE_RETRY_DELAY = 1.5
+_SESSION_DEAD_MARKERS = (
+    "previous_response_id",
+    "response_id",
+    "session",
+    "conversation",
+    "not found",
+    "does not exist",
+    "expired",
+    "invalid state",
+)
+
 
 # ─────────────────────── прогресс загрузки модели ───────────────────────
 
@@ -104,14 +117,9 @@ _URL_MODELS_UNLOAD = f"{LM_NATIVE_ROOT}/models/unload"
 _URL_CHAT          = f"{LM_NATIVE_ROOT}/chat"
 
 
-# ─────────────────────── список моделей (только native) ───────────────────────
+# ─────────────────────── список моделей ───────────────────────
 
 async def list_models_native() -> List[Dict[str, Any]]:
-    """GET /api/v1/models — список моделей в нативном формате.
-
-    Возвращает список словарей с ключами: key, display_name, type,
-    loaded_instances (если модель загружена) и т.п.
-    """
     try:
         resp = await get_lm_client().get(_URL_MODELS)
         resp.raise_for_status()
@@ -124,7 +132,6 @@ async def list_models_native() -> List[Dict[str, Any]]:
         if isinstance(obj, list):
             return obj
         if isinstance(obj, dict):
-            # v1: {"models": [...]}    v0: {"data": [...]}
             for k in ("models", "data", "result", "items"):
                 v = obj.get(k)
                 if isinstance(v, list):
@@ -148,7 +155,6 @@ async def list_models_native() -> List[Dict[str, Any]]:
 
 
 async def fetch_models() -> List[str]:
-    """Список ключей моделей для UI (native)."""
     models = await list_models_native()
     return [m.get("key") or m.get("id") for m in models
             if m.get("key") or m.get("id")]
@@ -199,7 +205,7 @@ async def sync_loaded_context_length() -> int:
     return n
 
 
-# ─────────────────────── load / unload (native v1) ───────────────────────
+# ─────────────────────── load / unload ───────────────────────
 
 async def load_model(
     model_key: str,
@@ -215,7 +221,6 @@ async def load_model(
     if context_length is None:
         context_length = config.DEFAULT_CONTEXT_LIMIT
 
-    # native v1: POST /models/load
     body: Dict[str, Any] = {
         "model": model_key,
         "context_length": context_length,
@@ -226,7 +231,6 @@ async def load_model(
         log.error("load_model error %s: %s", resp.status_code, resp.text[:1000])
     resp.raise_for_status()
     result = resp.json()
-    # Сбрасываем stateful-сессии: старые response_id больше не валидны.
     try:
         n = await store.reset_all_api_states()
         if n:
@@ -304,17 +308,14 @@ def _estimate_tokens(messages: List[Dict[str, Any]]) -> int:
     return text_tokens + image_count * 1500
 
 
-# ─────────────────────── chat_completion: NATIVE API ───────────────────────
+def estimate_context_tokens(history: List[Dict[str, Any]]) -> int:
+    """Публичная обёртка: оценка размера контекста в токенах."""
+    return _estimate_tokens(history)
+
+
+# ─────────────────────── native API: input helpers ───────────────────────
 
 def _to_native_input(msg: Any) -> Any:
-    """Приводит содержимое к формату native API /api/v1/chat.
-
-    native:
-      * строка — допустима для чисто текстового сообщения;
-      * список:
-          {"type": "text",  "content": "..."}
-          {"type": "image", "data_url": "data:image/jpeg;base64,..."}
-    """
     if isinstance(msg, str):
         return msg
     if not isinstance(msg, list):
@@ -334,7 +335,6 @@ def _to_native_input(msg: Any) -> Any:
             if url:
                 native.append({"type": "image", "data_url": url})
         elif ptype == "image":
-            # уже в native-формате
             native.append(part)
 
     if not native:
@@ -344,6 +344,89 @@ def _to_native_input(msg: Any) -> Any:
     return native
 
 
+def _extract_text_for_history(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            t = item.get("type")
+            if t == "text":
+                parts.append(item.get("text") or item.get("content") or "")
+            elif t in ("image_url", "image"):
+                parts.append("[image]")
+        return "\n".join(p for p in parts if p)
+    return str(content or "")
+
+
+def _build_history_input(
+    history: List[Dict[str, Any]],
+    current_native_input: Any,
+    max_context_tokens: int = 0,
+) -> Any:
+    """Собирает префикс из прошлых сообщений + текущий input в один запрос.
+
+    Используется, когда:
+      * stateful-сессия умерла и её надо восстановить;
+      * начинается fresh-сессия, но у пользователя уже есть история
+        (после /system, /load и т.п.).
+
+    System-сообщения пропускаются: system_prompt отправляется отдельным
+    полем payload["system_prompt"].
+
+    Если задан max_context_tokens, старые сообщения обрезаются так,
+    чтобы вписаться в ~70% лимита (остальное — запас на ответ).
+    """
+    # ── обрезка по бюджету ──
+    if max_context_tokens > 0 and history:
+        budget = int(max_context_tokens * 0.7)
+        cur_tokens = _estimate_tokens([{"role": "user", "content": current_native_input}])
+        budget -= cur_tokens
+        if budget < 0:
+            budget = 0
+        trimmed: List[Dict[str, Any]] = []
+        total = 0
+        for msg in reversed(history):
+            if (msg.get("role") or "").lower() == "system":
+                continue
+            t = _estimate_tokens([msg])
+            if total + t > budget:
+                break
+            trimmed.insert(0, msg)
+            total += t
+        history = trimmed
+
+    lines: List[str] = []
+    for msg in history:
+        role = (msg.get("role") or "user").lower()
+        if role == "system":
+            continue
+        text = _extract_text_for_history(msg.get("content"))
+        if not text:
+            continue
+        label = "User" if role == "user" else ("Assistant" if role == "assistant" else role.capitalize())
+        lines.append(f"{label}: {text}")
+
+    if not lines:
+        return current_native_input
+
+    prefix = (
+        "Previous conversation (for context):\n"
+        + "\n\n".join(lines)
+        + "\n\n---\n\nCurrent message:\n"
+    )
+
+    if isinstance(current_native_input, str):
+        return prefix + current_native_input
+    if isinstance(current_native_input, list):
+        return [{"type": "text", "content": prefix}] + current_native_input
+    return prefix + str(current_native_input)
+
+
+# ─────────────────────── chat_completion: NATIVE API ───────────────────────
+
 async def chat_completion(
     message: Any,
     model: str,
@@ -352,42 +435,30 @@ async def chat_completion(
     stop_event: Optional[asyncio.Event] = None,
     settings=None,
     system_prompt: str = "",
-    prior_summary: str = "",
     use_tools: bool = True,
-) -> tuple[str, Optional[Dict[str, int]], float, Optional[str]]:
+    thinking_enabled: bool = True,
+    history_context: Optional[List[Dict[str, Any]]] = None,
+) -> tuple[str, Optional[Dict[str, int]], float, Optional[str], bool]:
     """Native /api/v1/chat со stateful-режимом.
 
-    Возвращает (reply, usage, elapsed, response_id).
+    Возвращает (reply, usage, elapsed, response_id, session_reset).
     * usage is None  →  генерация прервана пользователем.
+    * session_reset  →  сессия была сброшена (stateful-контекст потерян).
 
-    Особенности работы с системным промптом:
-    * LM Studio держит system_prompt в stateful-сессии, но этот стейт
-      НЕ гарантирован: перезагрузка модели, внутренняя обрезка контекста,
-      смена response_id и т.п. — и промпт исчезает.
-    * Поэтому мы отправляем его отдельным полем payload["system_prompt"]
-      на КАЖДОМ ходу. Native API трактует это как override для текущей и
-      последующих реплик, так что промпт «не теряется» даже на длинных
-      диалогах.
-    * Резюме (prior_summary) при этом подмешивается только в input при
-      СТАРТЕ новой цепочки — при stateful-ходе оно уже в контексте модели,
-      дублировать его значит жечь токены.
-
-    MCP-инструменты (use_tools=True):
-    * payload["integrations"] содержит список серверов из mcp.json
-      в формате ["mcp/server1", "mcp/server2", ...].
-    * В отличие от system_prompt, integrations применяются К КАЖДОМУ
-      запросу — иначе после первого хода модель «забудет» про инструменты.
+    Особенности:
+    * system_prompt отправляется отдельным полем ТОЛЬКО при старте
+      новой сессии (или после session_reset).
+    * thinking_enabled=False → добавляет chat_template_kwargs.enable_thinking=False
+      (Qwen3 и другие reasoning-модели; для остальных моделей LM Studio
+      просто проигнорирует этот ключ).
+    * history_context — история на случай восстановления после падения
+      stateful-сессии или старта fresh-сессии с сохранённой историей.
     """
     temperature = getattr(settings, "temperature", config.DEFAULT_TEMPERATURE) if settings else config.DEFAULT_TEMPERATURE
     top_k       = getattr(settings, "top_k",       config.DEFAULT_TOP_K)       if settings else config.DEFAULT_TOP_K
     top_p       = getattr(settings, "top_p",       config.DEFAULT_TOP_P)       if settings else config.DEFAULT_TOP_P
     max_tokens  = getattr(settings, "max_tokens",  config.DEFAULT_MAX_TOKENS)  if settings else config.DEFAULT_MAX_TOKENS
-
-    log.info(
-        "Request (native): model=%s temp=%s top_p=%s top_k=%s max_output_tokens=%s prev_id=%s",
-        model, temperature, top_p, top_k, max_tokens,
-        (previous_response_id[:8] + "…") if previous_response_id else None,
-    )
+    ctx_limit   = getattr(settings, "context_limit", config.DEFAULT_CONTEXT_LIMIT) if settings else config.DEFAULT_CONTEXT_LIMIT
 
     # ── анимация ожидания ──
     thinking_stop = asyncio.Event()
@@ -404,21 +475,7 @@ async def chat_completion(
 
     start_time = time.monotonic()
 
-    # ── payload в формате native ──
     native_input = _to_native_input(message)
-
-    # Резюме прошлых сессий подмешиваем в input ТОЛЬКО при старте новой
-    # цепочки. На stateful-ходе оно уже в состоянии LM Studio.
-    if not previous_response_id and prior_summary.strip():
-        summary_block = (
-            "Контекст предыдущих сессий (резюме):\n" + prior_summary.strip()
-        )
-        if isinstance(native_input, str):
-            native_input = f"{summary_block}\n\n{native_input}"
-        elif isinstance(native_input, list):
-            native_input = [
-                {"type": "text", "content": summary_block}
-            ] + native_input
 
     payload: Dict[str, Any] = {
         "model": model,
@@ -426,22 +483,31 @@ async def chat_completion(
         "temperature": temperature,
         "top_p": top_p,
         "top_k": top_k,
-        "max_output_tokens": max_tokens,   # ← ключевое: НЕ max_tokens
+        "max_output_tokens": max_tokens,
     }
 
-    # system_prompt отдельным полем — ТОЛЬКО при старте новой сессии.
-    # На stateful-ходе LM Studio попытается вставить систему в середину
-    # цепочки, и chat template модели упадёт с ошибкой
-    # "System message must be at the beginning" (HTTP 500).
+    # System prompt — только в новой сессии.
     if not previous_response_id and system_prompt.strip():
         payload["system_prompt"] = system_prompt.strip()
 
     if previous_response_id:
         payload["previous_response_id"] = previous_response_id
 
-    # ── MCP интеграции (если включены) ──
-    # ВАЖНО: integrations применяются к КАЖДОМУ запросу (и на stateful-ходе
-    # тоже), иначе после первого хода модель «забудет» про инструменты.
+    # Если стартуем fresh-сессию, но есть история — префиксуем её.
+    # Это спасает контекст после /system, /load, /reload.
+    if not previous_response_id and history_context:
+        payload["input"] = _build_history_input(
+            history_context, native_input, max_context_tokens=ctx_limit,
+        )
+        log.info(
+            "Fresh session with history: %d prior message(s) prepended",
+            len(history_context),
+        )
+
+    # Thinking toggle (Qwen3 / reasoning модели через chat template).
+    if not thinking_enabled:
+        payload.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
+
     if use_tools:
         integrations = get_mcp_integrations()
         if integrations:
@@ -450,28 +516,24 @@ async def chat_completion(
                 "MCP integrations enabled: %d server(s) — %s",
                 len(integrations), ", ".join(integrations),
             )
-        else:
-            log.debug(
-                "MCP integrations enabled, but no servers found in mcp.json"
-            )
 
+    sp = system_prompt.strip()
+    sp_state = (
+        "none" if not sp
+        else ("sent" if "system_prompt" in payload else "in-state")
+    )
     log.info(
-        "Native request: system_prompt=%s (%d chars), summary=%s, "
-        "prev_id=%s, integrations=%s, input_type=%s",
-        "yes" if (not previous_response_id and system_prompt.strip()) else "no",
-        len(system_prompt.strip()),
-        "yes" if (not previous_response_id and prior_summary.strip()) else "no",
+        "Native request: system_prompt=%s (%d chars), prev_id=%s, "
+        "integrations=%s, thinking=%s, input_type=%s",
+        sp_state, len(sp),
         (previous_response_id[:8] + "…") if previous_response_id else None,
         len(payload.get("integrations") or []),
-        type(native_input).__name__,
+        "on" if thinking_enabled else "off",
+        type(payload["input"]).__name__,
     )
+    log.debug("Native payload: %s", json.dumps(payload, ensure_ascii=False)[:1500])
 
-    log.debug(
-        "Native payload: %s",
-        json.dumps(payload, ensure_ascii=False)[:1500],
-    )
-
-    # ── отправка ──
+    # ── отправка с поддержкой stop_event ──
     request_task: asyncio.Future = asyncio.ensure_future(
         get_lm_client().post(_URL_CHAT, json=payload)
     )
@@ -506,30 +568,58 @@ async def chat_completion(
 
     if stopped:
         log.info("Request stopped by user (elapsed=%.2fs)", elapsed)
-        return "", None, elapsed, None
+        return "", None, elapsed, None, False
 
-    # ── разбор ответа ──
     resp = request_task.result()
 
-    # Stateful-сессия могла протухнуть (рестарт LM Studio, обновление модели
-    # в обход нашего бота). Тогда повторяем один раз с чистого листа —
-    # на этот раз system_prompt уйдёт как отдельное поле.
-    if (
-        resp.status_code >= 400
-        and previous_response_id
-        and not stopped
-    ):
-        log.warning(
-            "Stateful turn failed (%s), retrying as fresh session",
-            resp.status_code,
-        )
-        payload.pop("previous_response_id", None)
-        if system_prompt.strip():
-            payload["system_prompt"] = system_prompt.strip()
-        resp = await get_lm_client().post(_URL_CHAT, json=payload)
+    # ── классификация ошибок stateful-сессии ──
+    session_reset = False
 
     if resp.status_code != 200:
-        # Самая важная часть — покажет, что именно не понравилось LM Studio.
+        status_code = resp.status_code
+        body_lower = (resp.text or "").lower()
+
+        # Класс 2: транзиентная — ретрай с сохранением сессии.
+        if status_code in (408, 429) or status_code >= 500:
+            log.warning(
+                "Transient HTTP %s — retry with session intact in %.1fs",
+                status_code, _STATE_RETRY_DELAY,
+            )
+            await asyncio.sleep(_STATE_RETRY_DELAY)
+            resp = await get_lm_client().post(_URL_CHAT, json=payload)
+            status_code = resp.status_code
+            body_lower = (resp.text or "").lower()
+
+        if previous_response_id:
+            # Класс 1: сессия мертва.
+            session_dead = status_code in (404, 410) or (
+                status_code == 400
+                and any(m in body_lower for m in _SESSION_DEAD_MARKERS)
+            )
+            if session_dead:
+                log.warning(
+                    "Stateful session is dead (HTTP %s): %s. "
+                    "Resetting and retrying as fresh session. "
+                    "⚠️ stateful-context lost.",
+                    status_code, (resp.text or "")[:300],
+                )
+                payload.pop("previous_response_id", None)
+                if system_prompt.strip():
+                    payload["system_prompt"] = system_prompt.strip()
+                if history_context:
+                    payload["input"] = _build_history_input(
+                        history_context, native_input,
+                        max_context_tokens=ctx_limit,
+                    )
+                resp = await get_lm_client().post(_URL_CHAT, json=payload)
+                session_reset = True
+            else:
+                log.warning(
+                    "Non-session HTTP %s on stateful turn — keeping session. "
+                    "Body: %s", status_code, (resp.text or "")[:300],
+                )
+
+    if resp.status_code != 200:
         log.error(
             "LM Studio %s on %s\nRequest payload: %s\nResponse body: %s",
             resp.status_code,
@@ -540,10 +630,7 @@ async def chat_completion(
     resp.raise_for_status()
     data = resp.json()
 
-    # native: {"output": [{"type": "message", "content": "..."}], "response_id": "..."}
-    # Модели с reasoning могут вернуть дополнительные блоки:
-    #   {"type": "reasoning", "content": "..."} — их нужно ОТБРАСЫВАТЬ,
-    #   иначе размышления утекут в ответ пользователю.
+    # ── парсинг output ──
     _SKIP_OUTPUT_TYPES = {
         "reasoning", "thinking", "analysis", "thought", "chain_of_thought",
     }
@@ -557,8 +644,6 @@ async def chat_completion(
             if itype in _SKIP_OUTPUT_TYPES:
                 continue
             if itype == "tool_call":
-                # LM Studio уже выполнил вызов, нам нужен только финальный текст.
-                # Логируем для отладки.
                 tool_name = item.get("tool") or item.get("name")
                 provider = item.get("provider_info") or {}
                 log.info(
@@ -577,12 +662,33 @@ async def chat_completion(
     response_id = data.get("response_id")
 
     # ── usage ──
-    usage_obj = data.get("usage") or data.get("stats")
-    if usage_obj is not None:
+    usage_obj = data.get("usage") or data.get("stats") or {}
+    log.debug(
+        "Native response usage=%r stats=%r",
+        data.get("usage"), data.get("stats"),
+    )
+
+    prompt_tokens = int(
+        usage_obj.get("prompt_tokens")
+        or usage_obj.get("input_tokens")
+        or 0
+    )
+    completion_tokens = int(
+        usage_obj.get("completion_tokens")
+        or usage_obj.get("total_output_tokens")
+        or usage_obj.get("output_tokens")
+        or 0
+    )
+    total_tokens = int(
+        usage_obj.get("total_tokens")
+        or (prompt_tokens + completion_tokens)
+    )
+
+    if prompt_tokens or completion_tokens:
         usage = {
-            "prompt_tokens":     int(usage_obj.get("prompt_tokens", 0) or 0),
-            "completion_tokens": int(usage_obj.get("completion_tokens", 0) or 0),
-            "total_tokens":      int(usage_obj.get("total_tokens", 0) or 0),
+            "prompt_tokens":     prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens":      total_tokens,
         }
         source = "api"
     else:
@@ -597,51 +703,109 @@ async def chat_completion(
 
     log.info(
         "Request done: chars=%d elapsed=%.2fs usage_source=%s "
-        "prompt=%d completion=%d total=%d response_id=%s",
+        "prompt=%d completion=%d total=%d response_id=%s session_reset=%s",
         len(reply), elapsed, source,
         usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"],
-        response_id,
+        response_id, session_reset,
     )
 
-    if not reply:
-        log.warning("LM Studio returned empty response")
-
-    return reply, usage, elapsed, response_id
+    return reply, usage, elapsed, response_id, session_reset
 
 
 # ─────────────────────── анимация ожидания ───────────────────────
 
-# Ротация эмодзи — это и делает анимацию «живой».
 _THINKING_EMOJIS = (
     "🧠", "💭", "✨", "⚡", "🎯", "🎨", "🚀", "💫",
-    "🌟", "🔮", "⚙️", "🛰️",
+    "🌟", "🔮", "⚙️", "🛰️", "🌀", "📡", "🪄", "🔭",
 )
-_THINKING_VERB = "Генерирую"
 
-_THINKING_MIN_INTERVAL = 0.6
-_THINKING_MAX_INTERVAL = 1.5
+_THINKING_VERBS = (
+    "Генерирую",
+    "Думаю",
+    "Размышляю",
+    "Соображаю",
+    "Считаю токены",
+    "Ворожу",
+    "Собираю мысли",
+    "Творю",
+    "Кручу шестерёнки",
+    "Советуюсь с моделью",
+    "Ищу ответ",
+    "Пишу",
+)
+
+# Короткие «хвосты», которые цепляются к глаголу.
+_THINKING_TAILS = (
+    "…",
+    "… почти",
+    "… ещё чуть-чуть",
+    "… уже близко",
+    "… без паники",
+    "… не спеша",
+    "… со вкусом",
+    "… вдумчиво",
+    "… на максималках",
+    "… по классике",
+    "… аккуратно",
+    "… в фоне",
+    "… без лишнего шума",
+    "… и немного магии",
+    "… как следует",
+)
+
+# «Акценты» — редкая вторая строка, добавляет живости.
+_THINKING_ACCENTS = (
+    "🫧 токены летят",
+    "🎼 подбираю рифму",
+    "🍵 завариваю ответ",
+    "🧩 складываю пазл",
+    "🛠 подкручиваю гайки",
+    "🎲 бросаю кубики",
+    "🪄 колдую над промптом",
+    "📚 листаю контекст",
+    "🌊 синхронизируюсь с сервером",
+    "🛰 жду пакет с ответом",
+    "🐢 медленно, но верно",
+    "🦾 держу удар",
+)
+
+_THINKING_MIN_INTERVAL = 0.9
+_THINKING_MAX_INTERVAL = 1.6
+_THINKING_ACCENT_CHANCE = 0.35
 
 
-def _render_thinking_frame(tick: int) -> str:
+def _pick_tail(prev: Optional[str]) -> str:
+    """Случайный хвост, не совпадающий с предыдущим (чтобы не залипало)."""
+    if prev is None or len(_THINKING_TAILS) <= 1:
+        return random.choice(_THINKING_TAILS)
+    tail = random.choice(_THINKING_TAILS)
+    while tail == prev:
+        tail = random.choice(_THINKING_TAILS)
+    return tail
+
+
+def _render_thinking_frame(tick: int, tail: str) -> str:
     emoji = _THINKING_EMOJIS[tick % len(_THINKING_EMOJIS)]
-    return f"{emoji} {_THINKING_VERB}"
+    verb = _THINKING_VERBS[tick % len(_THINKING_VERBS)]
+
+    frame = f"{emoji} {verb}{tail}"
+    if random.random() < _THINKING_ACCENT_CHANCE:
+        frame += "\n<i>" + random.choice(_THINKING_ACCENTS) + "</i>"
+    return frame
 
 
 async def _animate_thinking(status: Message, stop: asyncio.Event) -> None:
-    """Заметная анимация ожидания: смена эмодзи + бегущие точки.
-
-    Интервал рандомный в диапазоне 0.6–0.9 с — движение есть,
-    но Telegram не заваливается edit-запросами.
-    """
     tick = 0
+    prev_tail: Optional[str] = None
     while not stop.is_set():
-        frame = _render_thinking_frame(tick)
+        prev_tail = _pick_tail(prev_tail)
+        frame = _render_thinking_frame(tick, prev_tail)
+
         try:
             await status.edit_text(frame, reply_markup=stop_keyboard())
         except TelegramRetryAfter as exc:
             await asyncio.sleep(float(exc.retry_after) + 0.2)
         except TelegramBadRequest:
-            # «message is not modified» и прочее — молча пропускаем.
             pass
         except Exception:
             log.debug("thinking animation edit failed", exc_info=True)
@@ -658,107 +822,9 @@ async def _animate_thinking(status: Message, stop: asyncio.Event) -> None:
             pass
 
 
-# ─────────────────────── summary ───────────────────────
-
-def _extract_text_for_summary(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: List[str] = []
-        for p in content:
-            if not isinstance(p, dict):
-                continue
-            t = p.get("type")
-            if t == "text":
-                parts.append(p.get("text") or p.get("content") or "")
-            elif t in ("image_url", "image"):
-                parts.append("[изображение]")
-        return "\n".join(x for x in parts if x)
-    return str(content)
-
-
-_SUMMARY_SKIP_OUTPUT_TYPES = {
-    "reasoning", "thinking", "analysis", "thought", "chain_of_thought",
-}
-
-
-async def summarize_history(
-    history: List[Dict[str, Any]],
-    model: str,
-    prior_summary: str = "",
-) -> str:
-    """Сгенерировать резюме по локальной истории (+ предыдущему резюме).
-
-    Возвращает строку; пустая строка — если нечего суммировать или ошибка.
-    """
-    if not history and not prior_summary.strip():
-        return ""
-
-    blocks: List[str] = []
-    if prior_summary.strip():
-        blocks.append(f"[Ранее было:]\n{prior_summary.strip()}")
-
-    for m in history:
-        if not isinstance(m, dict):
-            continue
-        role = (m.get("role") or "?").upper()
-        text = _extract_text_for_summary(m.get("content"))
-        if text.strip():
-            blocks.append(f"{role}: {text}")
-
-    if not blocks:
-        return ""
-
-    transcript = "\n\n".join(blocks)
-    prompt = (
-        f"{config.SUMMARY_PROMPT}\n\n"
-        f"--- ДИАЛОГ ---\n{transcript}\n--- КОНЕЦ ---\n\n"
-        f"Резюме:"
-    )
-
-    payload: Dict[str, Any] = {
-        "model": model,
-        "input": prompt,
-        "temperature": 0.3,
-        "max_output_tokens": config.SUMMARY_MAX_TOKENS,
-    }
-
-    try:
-        resp = await get_lm_client().post(_URL_CHAT, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        log.exception("summarize_history: request failed")
-        return ""
-
-    output = data.get("output") or []
-    parts: List[str] = []
-    if isinstance(output, list):
-        for item in output:
-            if not isinstance(item, dict):
-                continue
-            itype = (item.get("type") or "").lower()
-            if itype in _SUMMARY_SKIP_OUTPUT_TYPES:
-                continue
-            c = item.get("content")
-            if c is None:
-                c = item.get("text")
-            if isinstance(c, str) and c:
-                parts.append(c)
-
-    summary = "".join(parts).strip()
-    if not summary:
-        log.warning("summarize_history: empty summary returned")
-    return summary
-
 # ─────────────────────── MCP интеграции ───────────────────────
 
 def get_mcp_integrations() -> List[str]:
-    """Возвращает список integrations для всех MCP-серверов из mcp.json.
-
-    Формат: ["mcp/server1", "mcp/server2", ...].
-    Если файл не найден или пуст — возвращает [].
-    """
     import json as _json
     import os as _os
 
@@ -778,5 +844,4 @@ def get_mcp_integrations() -> List[str]:
     if not isinstance(servers, dict):
         return []
 
-    # Ключи mcpServers — это имена серверов, например "playwright"
     return [f"mcp/{name}" for name in servers.keys()]

@@ -30,7 +30,7 @@ from ..lm import (
     list_models_native,
     run_with_progress,
     sync_loaded_context_length,
-    summarize_history,
+    estimate_context_tokens,
 )
 
 from ..storage import store
@@ -138,9 +138,16 @@ async def cb_regenerate(query: CallbackQuery) -> None:
             settings = await store.get_settings(user_id)
 
             system_prompt = await store.get_system_prompt(user_id)
-            prior_summary = await store.get_summary(user_id)
+            thinking_enabled = await store.is_thinking_enabled()
 
-            reply, usage, elapsed, new_resp_id = await chat_completion(
+            # История уже без последнего assistant (drop_last_assistant),
+            # но с последним user — который мы и регенерируем. Убираем
+            # его из history_context, чтобы не дублировать.
+            history_for_context = await store.get_with_system(user_id)
+            if history_for_context and history_for_context[-1].get("role") == "user":
+                history_for_context = history_for_context[:-1]
+
+            reply, usage, elapsed, new_resp_id, session_reset = await chat_completion(
                 message=last_user_content,
                 model=model,
                 status=status,
@@ -148,27 +155,49 @@ async def cb_regenerate(query: CallbackQuery) -> None:
                 stop_event=stop_event,
                 settings=settings,
                 system_prompt=system_prompt,
-                prior_summary=prior_summary,
                 use_tools=await store.is_tools_enabled(),
+                thinking_enabled=thinking_enabled,
+                history_context=history_for_context,
             )
 
+            if session_reset:
+                await store.reset_api_state(user_id)
             if new_resp_id:
                 await store.set_response_id(user_id, new_resp_id)
 
             if usage is not None:
+                if reply:
+                    await store.append_assistant(user_id, reply)
+                    await save_exchange(user_id, last_user_content, reply)
+
+                history_now = await store.get_with_system(user_id)
+                estimated = estimate_context_tokens(history_now)
+                cumulative = await store.update_cumulative_tokens(
+                    user_id, usage["prompt_tokens"]
+                )
+                effective = max(estimated, cumulative)
+
                 await store.set_usage(
                     user_id,
                     usage["prompt_tokens"],
                     usage["completion_tokens"],
                     usage["total_tokens"],
+                    effective_tokens=effective,
                 )
-                if reply:
-                    await store.append_assistant(user_id, reply)
-                    await save_exchange(user_id, last_user_content, reply)
 
-                stats = render_stats(
-                    usage, elapsed, settings, loaded_ctx=loaded_ctx
-                ) + maybe_tip()
+                note = (
+                    "\n\n⚠️ <i>Stateful-сессия LM Studio была сброшена "
+                    "(сервер сообщил, что она недействительна). "
+                    "Модель не видит предыдущий контекст.</i>"
+                ) if session_reset else ""
+                stats = (
+                    render_stats(
+                        usage, elapsed, settings,
+                        loaded_ctx=loaded_ctx, used_tokens=effective,
+                    )
+                    + maybe_tip()
+                    + note
+                )
             else:
                 stats = ""
 

@@ -65,7 +65,13 @@ async def on_startup() -> None:
         store.set_models([], ttl=0.0)
     except Exception as exc:
         dump_exception(exc, context="startup.set_models")
-
+        # Tools и Thinking при старте всегда выключены — даже если polling
+    # перезапускается после падения, а пользователь ранее включал их вручную.
+    try:
+        await store.set_tools_enabled(False)
+        await store.set_thinking_enabled(False)
+    except Exception as exc:
+        dump_exception(exc, context="startup.reset_flags")
     try:
         models = await fetch_models()
         if models:

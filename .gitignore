@@ -8,6 +8,7 @@ authorized_users.json
 tracked_messages.json
 chat_log.jsonl
 saved_photos/
+crash_dump/
 
 # питон
 __pycache__/
@@ -28,7 +29,6 @@ venv/
 logs/
 .env
 chat_log.jsonl
-saved_photos/
 authorized_users.json
 tracked_messages.json
 system_prompts.json

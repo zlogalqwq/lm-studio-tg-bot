@@ -12,7 +12,6 @@ from ..lm import (
     list_models_native,
     list_loaded_instances,
     load_model,
-    summarize_history,
     unload_all_models,
     unload_model,
     reload_model,
@@ -49,7 +48,9 @@ async def cmd_start(message: Message) -> None:
         "📊 <code>/models</code> — управление моделями (список, загрузка, выгрузка).\n\n"
         "🚫 <b>Не поддерживается:</b> стикеры, видео, GIF, голосовые, аудио.\n"
         "⚠️ Пока идёт генерация, новые сообщения игнорируются.\n"
-        "🔧 <code>/settings</code> — параметры генерации  ·  ℹ️ <code>/about</code> — о боте"
+        "🔧 <code>/settings</code> — параметры генерации.\n"
+        "🧠 <code>/think</code> — thinking.\n"
+        "ℹ️ <code>/about</code> — о боте"
     )
     sent = await message.answer(text)
     await store.track_message(user_id, sent.chat.id, sent.message_id)
@@ -293,13 +294,13 @@ async def cmd_help(message: Message) -> None:
         "/models — список моделей LM Studio\n"
         "/load — загрузить модель\n"
         "/tools — включить/выключить MCP-инструменты\n"
+        "/think — включить/выключить thinking (Qwen3)\n"
         "/unload — выгрузить модель (<code>/unload all</code> — всё)\n"
         "/reload — перезагрузить текущую модель\n"
         "/settings — показать/изменить параметры генерации\n"
         "/temp — температура (всем)\n"
         "/topk, /topp, /ctxlimit, /maxtokens — 🔒 только для админа\n"
         "/system — системный промпт\n"
-        "/summary — резюме диалога (show/gen/clear)\n"
         "/reset_settings — сбросить настройки\n\n"
         "🔐 <b>Админ</b>\n"
         "/sudo пароль — войти в админ-режим\n"
@@ -320,13 +321,22 @@ async def cmd_settings(message: Message) -> None:
     limit = loaded_ctx if loaded_ctx > 0 else s.context_limit
     used = s.last_total_tokens
 
+    # ── Текущее состояние переключателей ──
+    thinking_on = await store.is_thinking_enabled()
+    tools_on = await store.is_tools_enabled()
+    thinking_str = "🧠 включён" if thinking_on else "⚡ выключен"
+    tools_str = "✅ включены" if tools_on else "🔕 выключены"
+
     text = (
         "<b>⚙️ Настройки генерации</b>\n\n"
         f"🌡 Температура: <code>{s.temperature}</code>\n"
         f"🎯 top_k: <code>{s.top_k}</code>🔒\n"
         f"🎲 top_p: <code>{s.top_p}</code>🔒\n"
         f"📏 Лимит контекста (LM Studio): <code>{limit}</code>🔒\n"
-        f"📝 Макс. токенов за 1 ответ: <code>{s.max_tokens}</code>🔒\n"
+        f"📝 Макс. токенов за 1 ответ: <code>{s.max_tokens}</code>🔒\n\n"
+        f"<b>Переключатели</b>\n"
+        f"🧠 Thinking: {thinking_str} — <code>/think on|off</code>\n"
+        f"🛠 Инструменты (MCP): {tools_str} — <code>/tools on|off</code>\n\n"
         "<b>Изменить:</b>\n"
         "<code>/temp 1.2</code> — температура (0.0–2.0)\n"
         "<code>/topk 30</code> — top_k 🔒\n"
@@ -600,78 +610,6 @@ async def cmd_about(message: Message) -> None:
     sent = await message.answer(text)
     await store.track_message(user_id, sent.chat.id, sent.message_id)
 
-@router.message(Command("summary"))
-async def cmd_summary(message: Message) -> None:
-    """Управление резюме диалога.
-
-    /summary        — показать текущее или сгенерировать новое
-    /summary show   — показать сохранённое
-    /summary gen    — сгенерировать по текущей истории
-    /summary clear  — удалить резюме
-    """
-    user_id = message.from_user.id
-    args = (message.text or "").split(maxsplit=1)
-    sub = (args[1].strip().lower() if len(args) > 1 else "")
-
-    if sub in ("clear", "reset", "off"):
-        await store.clear_summary(user_id)
-        sent = await message.answer("✅ Резюме диалога удалено.")
-        await store.track_message(user_id, sent.chat.id, sent.message_id)
-        return
-
-    if sub in ("show", "view"):
-        current = await store.get_summary(user_id)
-        if current:
-            body = (
-                "<b>📝 Резюме диалога</b>\n\n"
-                f"<pre>{html.escape(current)}</pre>\n\n"
-                "Пересоздать: <code>/summary gen</code>\n"
-                "Удалить: <code>/summary clear</code>"
-            )
-        else:
-            body = (
-                "<b>📝 Резюме пока нет</b>\n\n"
-                "Создать по текущему диалогу: <code>/summary gen</code>\n"
-                "Резюме автоматически подмешивается в следующий запрос "
-                "после переполнения контекста."
-            )
-        sent = await message.answer(body)
-        await store.track_message(user_id, sent.chat.id, sent.message_id)
-        return
-
-    # По умолчанию и "gen" — сгенерировать резюме.
-    history = await store.get(user_id)
-    current = await store.get_summary(user_id)
-
-    if not history and not current:
-        sent = await message.answer("🤷 Нечего резюмировать — диалог пуст.")
-        await store.track_message(user_id, sent.chat.id, sent.message_id)
-        return
-
-    status = await message.answer("📝 Составляю резюме…")
-    await store.track_message(user_id, status.chat.id, status.message_id)
-
-    try:
-        model = await get_model()
-    except Exception as exc:
-        await status.edit_text(
-            f"❌ Не удалось получить модель: <code>{safe_code(exc)}</code>"
-        )
-        return
-
-    summary = await summarize_history(history, model, current)
-    if not summary:
-        await status.edit_text("❌ Не удалось составить резюме.")
-        return
-
-    await store.set_summary(user_id, summary)
-    await status.edit_text(
-        "<b>📝 Резюме диалога</b>\n\n"
-        f"<pre>{html.escape(summary)}</pre>\n\n"
-        "Показать: <code>/summary show</code> · "
-        "Удалить: <code>/summary clear</code>\n"
-        "Резюме подмешивается в следующий запрос после сброса контекста."
-    )
 
 @router.message(Command("tools"))
 async def cmd_tools(message: Message) -> None:
@@ -705,5 +643,43 @@ async def cmd_tools(message: Message) -> None:
             "Использование:\n"
             "<code>/tools on</code> — включить\n"
             "<code>/tools off</code> — выключить"
+        )
+    await store.track_message(user_id, sent.chat.id, sent.message_id)
+
+@router.message(Command("think"))
+async def cmd_think(message: Message) -> None:
+    """Управление thinking-режимом (Qwen3 / reasoning модели).
+
+    /think          — показать статус
+    /think on       — включить
+    /think off      — выключить
+    """
+    user_id = message.from_user.id
+    args = (message.text or "").split(maxsplit=1)
+    arg = args[1].strip().lower() if len(args) > 1 else ""
+
+    if arg in ("on", "1", "true", "yes"):
+        await store.set_thinking_enabled(True)
+        sent = await message.answer(
+            "🧠 <b>Thinking включён.</b>\n"
+            "Модель будет рассуждать перед ответом "
+            "(медленнее, но точнее для сложных задач)."
+        )
+    elif arg in ("off", "0", "false", "no"):
+        await store.set_thinking_enabled(False)
+        sent = await message.answer(
+            "⚡ <b>Thinking выключен.</b>\n"
+            "Модель будет отвечать сразу, без блока размышлений "
+            "(быстрее, экономит токены). Работает для Qwen3 и "
+            "других reasoning-моделей через chat template."
+        )
+    else:
+        enabled = await store.is_thinking_enabled()
+        status = "🧠 включён" if enabled else "⚡ выключен"
+        sent = await message.answer(
+            f"<b>Thinking:</b> {status}\n\n"
+            "Использование:\n"
+            "<code>/think on</code> — включить\n"
+            "<code>/think off</code> — выключить"
         )
     await store.track_message(user_id, sent.chat.id, sent.message_id)

@@ -67,13 +67,15 @@ COMMAND_COOLDOWN_EXEMPT: frozenset[str] = frozenset(
 DEFAULT_TEMPERATURE: float = float(os.environ.get("DEFAULT_TEMPERATURE", "0.9"))
 DEFAULT_TOP_K: int = int(os.environ.get("DEFAULT_TOP_K", "20"))
 DEFAULT_TOP_P: float = float(os.environ.get("DEFAULT_TOP_P", "0.95"))
-DEFAULT_CONTEXT_LIMIT: int = int(os.environ.get("DEFAULT_CONTEXT_LIMIT", "20000"))
-DEFAULT_MAX_TOKENS: int = int(os.environ.get("DEFAULT_MAX_TOKENS", "8192"))
+DEFAULT_CONTEXT_LIMIT: int = int(os.environ.get("DEFAULT_CONTEXT_LIMIT", "22000"))
+DEFAULT_MAX_TOKENS: int = int(os.environ.get("DEFAULT_MAX_TOKENS", "4096"))
+
+
+# ── Резюме диалога (нужен storage.py) ──
+SUMMARY_FILE: str = os.environ.get("SUMMARY_FILE", "summaries.json")
 
 # ── Пороги использования контекста ──
 CONTEXT_WARN_RATIO: float = float(os.environ.get("CONTEXT_WARN_RATIO", "0.80"))
-CONTEXT_AUTO_CLEAR_RATIO: float = float(os.environ.get("CONTEXT_AUTO_CLEAR_RATIO", "0.95"))
-CONTEXT_KEEP_ON_CLEAR: int = int(os.environ.get("CONTEXT_KEEP_ON_CLEAR", "4"))
 
 # ── Анимация ожидания
 THINKING_INTERVAL: float = float(os.environ.get("THINKING_INTERVAL", "1.4"))
@@ -86,7 +88,7 @@ MAX_SYSTEM_PROMPT_CHARS: int = int(os.environ.get("MAX_SYSTEM_PROMPT_CHARS", "40
 MCP_JSON_PATH: str = os.environ.get(
     "MCP_JSON_PATH", os.path.expanduser("~/.lmstudio/mcp.json")
 )
-TOOLS_ENABLED_BY_DEFAULT: bool = os.environ.get("TOOLS_ENABLED", "1") == "1"
+
 
 def setup_logging() -> None:
     # Windows-консоль по умолчанию не UTF-8 — форсируем.
@@ -124,13 +126,3 @@ ADMIN_IDS: frozenset[int] = _parse_ids(os.environ.get("ADMIN_IDS", ""))
 
 # ── Дампы крашей ──
 CRASH_DUMP_DIR: str = os.environ.get("CRASH_DUMP_DIR", "crash_dump")
-
-# ── Резюме диалога ──
-SUMMARY_FILE: str = os.environ.get("SUMMARY_FILE", "conversation_summaries.json")
-SUMMARY_PROMPT: str = os.environ.get(
-    "SUMMARY_PROMPT",
-    "Ты — архивариус диалога. Кратко перескажи беседу, сохранив ключевые "
-    "факты, решения, договорённости и имена. Пиши от третьего лица, в "
-    "прошедшем времени, без воды и без вводных фраз. 5–15 предложений."
-)
-SUMMARY_MAX_TOKENS: int = int(os.environ.get("SUMMARY_MAX_TOKENS", "1024"))

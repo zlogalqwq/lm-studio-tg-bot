@@ -18,7 +18,7 @@ from ..lm import (
     chat_completion,
     get_model,
     sync_loaded_context_length,
-    summarize_history,
+    estimate_context_tokens,
 )
 
 
@@ -76,62 +76,68 @@ async def handle_message(
                 doc = message.document
                 if doc is not None and not (doc.mime_type or "").startswith(IMAGE_MIME_PREFIXES):
                     await status.delete()
+                    await store.untrack_message(user_id, status.chat.id, status.message_id)
                     sent = await message.answer("❌ Поддерживаются только изображения и текст.")
                     await store.track_message(user_id, sent.chat.id, sent.message_id)
                     return
 
+            # ── 1. Готовим контент ДО каких-либо изменений истории ──
             content = await build_content(album, message, user_id)
-            await store.append_user(user_id, content)
-            # Перегенерация отправит только текст — картинки уже в состоянии LM Studio.
-            await store.set_last_user_input(user_id, prompt_text)
 
             model = await get_model()
             await sync_loaded_context_length()
             loaded_ctx = await store.get_loaded_context_length()
 
             settings = await store.get_settings(user_id)
-            limit = loaded_ctx if loaded_ctx > 0 else settings.context_limit
 
-            # ── Авторезюмирование при переполнении контекста ──
-            # Если прошлый запрос занял почти весь контекст — сохраняем
-            # резюме диалога, сбрасываем stateful-сессию и начинаем заново.
-            if settings.last_prompt_tokens > 0 and limit > 0:
-                ratio = settings.last_prompt_tokens / limit
-                if ratio >= config.CONTEXT_AUTO_CLEAR_RATIO:
-                    old_history = await store.get(user_id)
-                    old_summary = await store.get_summary(user_id)
-                    new_summary = await summarize_history(
-                        old_history, model, old_summary
+            # ── 2. Эффективный лимит: физический ИЛИ пользовательский, что меньше. ──
+            user_limit = settings.context_limit
+            if loaded_ctx > 0 and user_limit > 0:
+                limit = min(loaded_ctx, user_limit)
+                if loaded_ctx != user_limit:
+                    log.info(
+                        "Context limit mismatch: user=%s loaded_ctx=%s "
+                        "user_limit=%s → effective=%s",
+                        user_id, loaded_ctx, user_limit, limit,
                     )
-                    await store.reset_context(user_id)
-                    if new_summary:
-                        await store.set_summary(user_id, new_summary)
-                    warn = await message.answer(
-                        "🔄 <b>Контекст переполнен.</b> Я сохранил резюме "
-                        "диалога и начал новый сеанс.\n"
-                        "Показать: <code>/summary show</code> · "
-                        "Сбросить: <code>/summary clear</code>"
-                    )
-                    await store.track_message(
-                        user_id, warn.chat.id, warn.message_id
-                    )
-                elif ratio >= config.CONTEXT_WARN_RATIO:
+            else:
+                limit = loaded_ctx if loaded_ctx > 0 else user_limit
+
+            # ── 3. Снимок истории ДО добавления текущего сообщения ──
+            history_for_context = await store.get_with_system(user_id)
+
+            # ── 4. Предупреждение о заполнении контекста (по эффективному счётчику). ──
+            effective_used = settings.last_effective_tokens
+            if effective_used <= 0:
+                effective_used = settings.last_prompt_tokens
+            if effective_used > 0 and limit > 0:
+                ratio = effective_used / limit
+                log.info(
+                    "context check: user=%s used=%d limit=%d ratio=%.3f",
+                    user_id, effective_used, limit, ratio,
+                )
+                if ratio < config.CONTEXT_WARN_RATIO:
+                    settings.context_warned = False
+                elif not settings.context_warned:
+                    settings.context_warned = True
                     pct = int(ratio * 100)
                     warn = await message.answer(
                         f"⚠️ Контекст заполнен на <b>{pct}%</b> "
-                        f"({settings.last_prompt_tokens}/{limit}).\n"
-                        f"Очистить: /clean · Резюмировать: /summary"
+                        f"({effective_used}/{limit}).\n"
+                        f"Модель скоро начнёт обрезать историю. "
+                        f"Начать с чистого листа: /clean"
                     )
-                    await store.track_message(
-                        user_id, warn.chat.id, warn.message_id
-                    )
+                    await store.track_message(user_id, warn.chat.id, warn.message_id)
 
-            # ── Основной запрос к нативному stateful API ──
+            # ── 5. Теперь — в историю. ──
+            await store.append_user(user_id, content)
+            await store.set_last_user_input(user_id, prompt_text)
+
             prev_id = await store.get_response_id(user_id)
             system_prompt = await store.get_system_prompt(user_id)
-            prior_summary = await store.get_summary(user_id)
+            thinking_enabled = await store.is_thinking_enabled()
 
-            reply, usage, elapsed, new_resp_id = await chat_completion(
+            reply, usage, elapsed, new_resp_id, session_reset = await chat_completion(
                 message=content,
                 model=model,
                 status=status,
@@ -139,26 +145,51 @@ async def handle_message(
                 stop_event=stop_event,
                 settings=settings,
                 system_prompt=system_prompt,
-                prior_summary=prior_summary,
                 use_tools=await store.is_tools_enabled(),
+                thinking_enabled=thinking_enabled,
+                history_context=history_for_context,
             )
 
+            if session_reset:
+                await store.reset_api_state(user_id)
             if new_resp_id:
                 await store.set_response_id(user_id, new_resp_id)
 
             if usage is not None:
+                if reply:
+                    await store.append_assistant(user_id, reply)
+                    await save_exchange(user_id, content, reply)
+
+                # Оценка размера контекста: max(по истории, по API).
+                history_now = await store.get_with_system(user_id)
+                estimated = estimate_context_tokens(history_now)
+                cumulative = await store.update_cumulative_tokens(
+                    user_id, usage["prompt_tokens"]
+                )
+                effective = max(estimated, cumulative)
+
                 await store.set_usage(
                     user_id,
                     usage["prompt_tokens"],
                     usage["completion_tokens"],
                     usage["total_tokens"],
+                    effective_tokens=effective,
                 )
-                if reply:
-                    await store.append_assistant(user_id, reply)
-                    await save_exchange(user_id, content, reply)
-                stats = render_stats(
-                    usage, elapsed, settings, loaded_ctx=loaded_ctx
-                ) + maybe_tip()
+
+                note = (
+                    "\n\n⚠️ <i>Stateful-сессия LM Studio была сброшена "
+                    "(сервер сообщил, что она недействительна). "
+                    "Модель не видит предыдущий контекст. "
+                    "Начать с чистого листа: /clean</i>"
+                ) if session_reset else ""
+                stats = (
+                    render_stats(
+                        usage, elapsed, settings,
+                        loaded_ctx=limit, used_tokens=effective,
+                    )
+                    + maybe_tip()
+                    + note
+                )
             else:
                 stats = ""
 
@@ -167,7 +198,6 @@ async def handle_message(
                 status, reply, message, stopped=stopped, stats=stats
             )
             await finalize_and_track(user_id, status, sent)
-
         except (RuntimeError, ValueError) as exc:
             try:
                 await status.edit_text(
