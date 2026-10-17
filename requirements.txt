@@ -1,0 +1,11 @@
+# Telegram Bot API
+aiogram>=3.13,<4.0
+
+# OpenAI-совместимый клиент (LM Studio /v1)
+openai>=1.40,<2.0
+
+# Async HTTP-клиент для нативного API LM Studio (/api/v1)
+httpx>=0.27,<1.0
+
+# Загрузка .env
+python-dotenv>=1.0,<2.0

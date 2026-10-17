@@ -1,0 +1,36 @@
+# секреты
+.env
+*.env
+!.env.example
+
+# данные бота
+authorized_users.json
+tracked_messages.json
+chat_log.jsonl
+saved_photos/
+
+# питон
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# редакторы/ОС
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+venv/
+logs/
+.env
+chat_log.jsonl
+saved_photos/
+authorized_users.json
+tracked_messages.json
+system_prompts.json
+__pycache__/
+*.pyc
