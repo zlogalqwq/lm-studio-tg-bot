@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import Message
 
 from . import config
-from .core import lm_native_client, LM_NATIVE_ROOT
+from .core import get_lm_client, LM_NATIVE_ROOT
 from .keyboards import stop_keyboard
 from .storage import store
 
@@ -113,7 +113,7 @@ async def list_models_native() -> List[Dict[str, Any]]:
     loaded_instances (если модель загружена) и т.п.
     """
     try:
-        resp = await lm_native_client.get(_URL_MODELS)
+        resp = await get_lm_client().get(_URL_MODELS)
         resp.raise_for_status()
         payload = resp.json()
     except Exception:
@@ -221,7 +221,7 @@ async def load_model(
         "context_length": context_length,
     }
     log.info("POST %s  body=%s", _URL_MODELS_LOAD, body)
-    resp = await lm_native_client.post(_URL_MODELS_LOAD, json=body)
+    resp = await get_lm_client().post(_URL_MODELS_LOAD, json=body)
     if resp.status_code != 200:
         log.error("load_model error %s: %s", resp.status_code, resp.text[:1000])
     resp.raise_for_status()
@@ -239,7 +239,7 @@ async def load_model(
 async def unload_model(instance_id: str) -> Dict[str, Any]:
     body = {"instance_id": instance_id}
     log.info("POST %s  body=%s", _URL_MODELS_UNLOAD, body)
-    resp = await lm_native_client.post(_URL_MODELS_UNLOAD, json=body)
+    resp = await get_lm_client().post(_URL_MODELS_UNLOAD, json=body)
     if resp.status_code != 200:
         log.error("unload_model error %s: %s", resp.status_code, resp.text[:1000])
     resp.raise_for_status()
@@ -473,9 +473,8 @@ async def chat_completion(
 
     # ── отправка ──
     request_task: asyncio.Future = asyncio.ensure_future(
-        lm_native_client.post(_URL_CHAT, json=payload)
+        get_lm_client().post(_URL_CHAT, json=payload)
     )
-
     stopped = False
     stop_task: Optional[asyncio.Future] = None
     try:
@@ -527,7 +526,7 @@ async def chat_completion(
         payload.pop("previous_response_id", None)
         if system_prompt.strip():
             payload["system_prompt"] = system_prompt.strip()
-        resp = await lm_native_client.post(_URL_CHAT, json=payload)
+        resp = await get_lm_client().post(_URL_CHAT, json=payload)
 
     if resp.status_code != 200:
         # Самая важная часть — покажет, что именно не понравилось LM Studio.
@@ -725,7 +724,7 @@ async def summarize_history(
     }
 
     try:
-        resp = await lm_native_client.post(_URL_CHAT, json=payload)
+        resp = await get_lm_client().post(_URL_CHAT, json=payload)
         resp.raise_for_status()
         data = resp.json()
     except Exception:

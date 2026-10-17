@@ -19,12 +19,43 @@ _native_headers = {"Content-Type": "application/json"}
 if config.LM_STUDIO_API_TOKEN:
     _native_headers["Authorization"] = f"Bearer {config.LM_STUDIO_API_TOKEN}"
 
-# base_url НЕ используем — пути будут абсолютными
-lm_native_client = httpx.AsyncClient(
-    headers=_native_headers,
-    timeout=config.LM_STUDIO_TIMEOUT,
-)
 
+def _create_native_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        headers=_native_headers,
+        timeout=config.LM_STUDIO_TIMEOUT,
+    )
+
+
+lm_native_client: httpx.AsyncClient = _create_native_client()
+
+
+def get_lm_client() -> httpx.AsyncClient:
+    """Живой клиент к LM Studio.
+
+    Если предыдущий экземпляр был закрыт (например, из-за вызова
+    shutdown-хуков при падении polling с последующим перезапуском
+    цикла) — создаёт новый.
+    """
+    global lm_native_client
+    if lm_native_client is None or lm_native_client.is_closed:
+        lm_native_client = _create_native_client()
+    return lm_native_client
+
+
+async def close_lm_client() -> None:
+    """Идемпотентно закрывает клиент."""
+    global lm_native_client
+    client = lm_native_client
+    if client is None or client.is_closed:
+        return
+    try:
+        await client.aclose()
+    except Exception:
+        pass
+
+
+# ── Bot / Dispatcher / Router ──
 bot = Bot(
     token=config.TELEGRAM_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),

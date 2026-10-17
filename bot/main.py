@@ -3,6 +3,7 @@ import logging
 import os
 
 from aiogram.types import ErrorEvent
+from .core import bot, dp, router, close_lm_client, get_lm_client
 
 from . import config, middlewares  # noqa: F401
 from .config import setup_logging
@@ -16,7 +17,6 @@ from .handlers import commands, callbacks, messages  # noqa: F401
 from .lm import fetch_models
 from .storage import store
 
-from .core import bot, dp, router, lm_native_client
 
 setup_logging()
 install_global_hooks()
@@ -25,37 +25,35 @@ log = logging.getLogger(__name__)
 
 # ── Идемпотентное закрытие ресурсов ──
 _shutdown_lock = asyncio.Lock()
-_shutdown_done = False
 
 
 async def _shutdown_resources() -> None:
-    """Закрывает все сетевые ресурсы ровно один раз."""
-    global _shutdown_done
+    """Закрывает все сетевые ресурсы. Идемпотентна и безопасна
+    при многократном вызове из-за retry-цикла polling."""
     async with _shutdown_lock:
-        if _shutdown_done:
-            return
-        _shutdown_done = True
+        log.info("Bot shutting down…")
 
-    log.info("Bot shutting down…")
+        try:
+            await bot.session.close()
+        except Exception as exc:
+            dump_exception(exc, context="shutdown.bot_session")
 
-    try:
-        await bot.session.close()
-    except Exception as exc:
-        dump_exception(exc, context="shutdown.bot_session")
-
-    try:
-        await lm_native_client.aclose()
-    except Exception as exc:
-        dump_exception(exc, context="shutdown.lm_client")
+        try:
+            await close_lm_client()
+        except Exception as exc:
+            dump_exception(exc, context="shutdown.lm_client")
 
 
 @router.startup()
 async def on_startup() -> None:
-    try:
-        log.info("Bot starting")
-    except Exception:
-        pass
+    log.info("Bot starting")
 
+    # Пересоздаём HTTP-клиент, если предыдущий shutdown его закрыл,
+    # но polling затем был перезапущен retry-циклом.
+    try:
+        get_lm_client()
+    except Exception as exc:
+        dump_exception(exc, context="startup.get_lm_client")
     # Папки — не критично, если не получится.
     for path, tag in ((CRASH_DUMP_DIR, "crash_dump"), (config.PHOTO_DIR, "photo")):
         try:
