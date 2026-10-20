@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from aiogram import F
@@ -15,6 +16,7 @@ from ..images import (
     build_content,
     images_from_album,
     images_from_message,
+    validate_image_formats,
 )
 from ..keyboards import stop_keyboard, response_keyboard
 from ..storage import store
@@ -35,6 +37,10 @@ _DOWNLOAD_MAX_ATTEMPTS = 3
 _DOWNLOAD_BASE_DELAY = 1.0
 _DOWNLOAD_MAX_DELAY = 8.0
 
+# ── Уведомление о «занят» (чтобы не спамить одинаковыми сообщениями) ────────
+_BUSY_NOTIFY_COOLDOWN = 15.0
+_busy_notify_ts: Dict[int, float] = {}
+
 
 def _get_prompt_text(message: Message, album: Optional[List[Message]]) -> str:
     """Возвращает текст запроса: для альбома — первую непустую подпись, иначе text/caption."""
@@ -53,8 +59,8 @@ async def _build_content_with_retry(
 ) -> List[Dict[str, Any]]:
     """Скачивает фото с ретраями при сетевых ошибках Telegram.
 
-    Ретраит только ``TelegramNetworkError`` / ``TelegramRetryAfter``.
-    Прочие исключения (битый ``file_id``, превышение размера и т.п.)
+    Ретраит только TelegramNetworkError / TelegramRetryAfter.
+    Прочие исключения (битый file_id, превышение размера и т.п.)
     пробрасываются сразу — на них ретрай бессмысленен.
     """
     last_exc: Optional[BaseException] = None
@@ -94,6 +100,32 @@ async def _build_content_with_retry(
     raise last_exc
 
 
+async def _notify_busy(message: Message, user_id: int, n_photos: int) -> None:
+    """Сообщает пользователю, что запрос проигнорирован, но не чаще
+    _BUSY_NOTIFY_COOLDOWN секунд (чтобы не спамить при альбомах)."""
+    now = time.monotonic()
+    if now - _busy_notify_ts.get(user_id, 0.0) < _BUSY_NOTIFY_COOLDOWN:
+        return
+    _busy_notify_ts[user_id] = now
+    try:
+        if n_photos:
+            text = (
+                "⏳ <b>Уже обрабатываю предыдущий запрос.</b>\n\n"
+                f"Это сообщение (фото: {n_photos}) будет проигнорировано.\n"
+                "Дождитесь ответа и отправьте снова."
+            )
+        else:
+            text = (
+                "⏳ <b>Уже обрабатываю предыдущий запрос.</b>\n\n"
+                "Это сообщение будет проигнорировано.\n"
+                "Дождитесь ответа и отправьте снова."
+            )
+        sent = await message.answer(text)
+        await store.track_message(user_id, sent.chat.id, sent.message_id)
+    except Exception:
+        log.debug("busy notify failed", exc_info=True)
+
+
 @router.message(
     (F.text & ~F.text.startswith("/")) | F.photo | F.document
 )
@@ -102,6 +134,16 @@ async def handle_message(
     album: Optional[List[Message]] = None,
 ) -> None:
     user_id = message.from_user.id
+
+    # ── 0. Ранняя валидация форматов (HEIC/HEIF/AVIF): отсекаем ДО скачивания. ──
+    try:
+        validate_image_formats(album or [message])
+    except ValueError as exc:
+        sent = await message.answer(str(exc))
+        await store.track_message(user_id, sent.chat.id, sent.message_id)
+        return
+
+    # ── 1. Длина текста ──
     prompt_text = _get_prompt_text(message, album)
     if len(prompt_text) > config.MAX_INPUT_CHARS:
         sent = await message.answer(
@@ -110,6 +152,8 @@ async def handle_message(
         )
         await store.track_message(user_id, sent.chat.id, sent.message_id)
         return
+
+    # ── 2. Идёт операция с моделью? ──
     if await store.is_model_op_busy():
         log.info("User %s — model op in progress, message ignored", user_id)
         sent = await message.answer(
@@ -118,8 +162,17 @@ async def handle_message(
         )
         await store.track_message(user_id, sent.chat.id, sent.message_id)
         return
+
+    # ── 3. Пользователь уже генерирует? — уведомляем, а не дропаем молча. ──
     if not await store.try_acquire(user_id):
-        log.info("User %s is busy — message ignored", user_id)
+        n_photos = len(album) if album else (
+            1 if images_from_message(message) else 0
+        )
+        log.warning(
+            "User %s busy — dropped incoming: album=%s photos=%d has_text=%s",
+            user_id, bool(album), n_photos, bool(message.text),
+        )
+        await _notify_busy(message, user_id, n_photos)
         return
 
     stop_event = await store.start_generation(user_id)
@@ -149,9 +202,7 @@ async def handle_message(
                     )
                     return
 
-            # ── 1. Готовим контент ДО каких-либо изменений истории ──
-            #        (скачивание фото идёт с ретраями — сеть у Telegram
-            #         периодически рвётся на SSL-handshake)
+            # ── Готовим контент ДО каких-либо изменений истории ──
             content = await _build_content_with_retry(album, message, user_id)
 
             model = await get_model()
@@ -160,7 +211,7 @@ async def handle_message(
 
             settings = await store.get_settings(user_id)
 
-            # ── 2. Эффективный лимит: физический ИЛИ пользовательский, что меньше. ──
+            # ── Эффективный лимит: min(физический, пользовательский) ──
             user_limit = settings.context_limit
             if loaded_ctx > 0 and user_limit > 0:
                 limit = min(loaded_ctx, user_limit)
@@ -173,10 +224,10 @@ async def handle_message(
             else:
                 limit = loaded_ctx if loaded_ctx > 0 else user_limit
 
-            # ── 3. Снимок истории ДО добавления текущего сообщения ──
+            # ── Снимок истории до добавления текущего сообщения ──
             history_for_context = await store.get_with_system(user_id)
 
-            # ── 4. Предупреждение о заполнении контекста. ──
+            # ── Предупреждение о заполнении контекста ──
             effective_used = settings.last_effective_tokens
             if effective_used <= 0:
                 effective_used = settings.last_prompt_tokens
@@ -201,9 +252,10 @@ async def handle_message(
                         user_id, warn.chat.id, warn.message_id
                     )
 
-            # ── 5. Теперь — в историю. ──
+            # ── В историю ──
             await store.append_user(user_id, content)
-            await store.set_last_user_input(user_id, prompt_text)
+            await store.set_last_user_input(user_id, content)
+
 
             prev_id = await store.get_response_id(user_id)
             system_prompt = await store.get_system_prompt(user_id)
@@ -234,11 +286,12 @@ async def handle_message(
                     await store.append_assistant(user_id, reply)
                     await save_exchange(user_id, content, reply)
 
-                # Оценка размера контекста: max(по истории, по API).
                 history_now = await store.get_with_system(user_id)
                 estimated = estimate_context_tokens(history_now)
+                # FIX: передаём estimated как floor — эвристика delta/total
+                # больше не зависит от угадывания семантики API-поля.
                 cumulative = await store.update_cumulative_tokens(
-                    user_id, usage["prompt_tokens"]
+                    user_id, usage["prompt_tokens"], estimated_total=estimated,
                 )
                 effective = max(estimated, cumulative)
 
@@ -274,8 +327,6 @@ async def handle_message(
             await finalize_and_track(user_id, status, sent)
 
         except TelegramNetworkError as exc:
-            # Ретраи в _build_content_with_retry не помогли — сеть до
-            # api.telegram.org стабильно недоступна.
             log.warning(
                 "Telegram network error for user %s after retries: %s",
                 user_id, exc,

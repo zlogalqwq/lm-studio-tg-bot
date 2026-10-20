@@ -20,6 +20,34 @@ def _password_fingerprint(password: str) -> str:
 CURRENT_FINGERPRINT: str = _password_fingerprint(config.AUTH_PASSWORD)
 
 
+def _strip_image_payloads(content: Any) -> Any:
+    """Заменяет base64-пейлоады картинок на маркер, сохраняя структуру.
+
+    ``_history`` читается обратно только как текст (``_build_history_input``
+    всё равно подменяет изображения на ``[image]``). Держать в памяти
+    десятки мегабайт base64 между ходами бессмысленно — оставляем маркер,
+    чтобы токен-эстимейт (по 1500 на картинку) и рендеринг истории
+    оставались корректными.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return content
+    out: List[Any] = []
+    for part in content:
+        if not isinstance(part, dict):
+            out.append(part)
+            continue
+        ptype = part.get("type")
+        if ptype == "image_url":
+            out.append({"type": "image_url", "image_url": {"url": "[image]"}})
+        elif ptype == "image":
+            out.append({"type": "image", "data_url": "[image]"})
+        else:
+            out.append(part)
+    return out
+
+
 class UserSettings:
     """Персональные настройки генерации для пользователя."""
     __slots__ = (
@@ -194,16 +222,15 @@ class ChatStore:
         self._admin_sessions: Dict[int, float] = {}
         self._last_message_ts: Dict[Tuple[str, int], float] = {}
         self._system_prompts: Dict[int, str] = _load_system_prompts()
-        self._summaries: Dict[int, str] = _load_summaries()          # FIX: was missing
+        self._summaries: Dict[int, str] = _load_summaries()
         self._loaded_context_length: int = 0
         self._response_ids: Dict[int, str] = {}
-        self._response_id_history: Dict[int, List[str]] = {}         # replaces _prev_response_ids
-        self._cumulative_prompt_tokens: Dict[int, int] = {}          # NEW
+        self._response_id_history: Dict[int, List[str]] = {}
+        self._cumulative_prompt_tokens: Dict[int, int] = {}
         self._last_user_input: Dict[int, Any] = {}
-        # Tools выключены при старте процесса (включаются вручную
-        # через /tools on). Thinking включён по умолчанию.
-        # Значения из .env (TOOLS_ENABLED / DEFAULT_THINKING) намеренно
-        # игнорируются.
+        # FIX: список сообщений последнего ответа — для корректного /regenerate
+        # (удаляем все чанки, а не только последний).
+        self._last_response_messages: Dict[int, List[Tuple[int, int]]] = {}
         self._tools_enabled: bool = False
         self._thinking_enabled: bool = True
 
@@ -225,24 +252,42 @@ class ChatStore:
         async with self._lock:
             self._tools_enabled = bool(enabled)
 
-    # ── Cumulative tokens (для корректного бара контекста) ────────────
-    async def update_cumulative_tokens(self, user_id: int, prompt_tokens: int) -> int:
+    # ── Cumulative tokens ─────────────────────────────────────────────
+    async def update_cumulative_tokens(
+        self,
+        user_id: int,
+        prompt_tokens: int,
+        estimated_total: int = 0,
+    ) -> int:
         """Учитывает API prompt_tokens с эвристикой delta vs total.
 
-        * delta (LM Studio вернул только прирост) → складываем;
-        * total (LM Studio вернул суммарный размер сессии) → заменяем.
+        ``estimated_total`` — наш собственный эстимейт полного промпта
+        (текст + картинки в истории + текущее сообщение). Используется
+        как нижняя граница и как якорь для разрешения неоднозначности
+        между delta- и total-семантикой API.
         """
         async with self._lock:
             prev = self._cumulative_prompt_tokens.get(user_id, 0)
             pt = int(prompt_tokens or 0)
             if pt <= 0:
                 return prev
+
+            floor = int(estimated_total or 0)
+
             if prev == 0:
-                new = pt
-            elif pt < int(prev * 0.95):
-                new = prev + pt
+                # Первый замер — доверяем API, но не ниже эстимейта.
+                new = max(pt, floor) if floor > 0 else pt
+            elif pt < prev:
+                # API вернул меньше предыдущего значения — почти наверняка
+                # delta. Но если наш эстимейт говорит «сессия уменьшилась»
+                # (< prev/2) — это total усечённой сессии (после reset).
+                if floor > 0 and floor < prev // 2:
+                    new = max(pt, floor)
+                else:
+                    new = prev + pt
             else:
-                new = pt
+                new = max(pt, floor) if floor > 0 else pt
+
             self._cumulative_prompt_tokens[user_id] = new
             return new
 
@@ -284,6 +329,12 @@ class ChatStore:
         async with self._lock:
             self._response_ids.pop(user_id, None)
             self._response_id_history.pop(user_id, None)
+            # FIX: сбрасываем накопленные токены — иначе после session_reset
+            # update_cumulative_tokens примет новый prompt_tokens за delta.
+            self._cumulative_prompt_tokens.pop(user_id, None)
+
+    async def reset_model_context(self, user_id: int) -> None:
+        await self.clear(user_id)
 
     async def reset_all_api_states(self) -> int:
         async with self._lock:
@@ -301,6 +352,7 @@ class ChatStore:
             self._response_id_history.pop(user_id, None)
             self._cumulative_prompt_tokens.pop(user_id, None)
             self._last_user_input.pop(user_id, None)
+            self._last_response_messages.pop(user_id, None)
             s = self._settings.get(user_id)
             if s:
                 s.reset_usage()
@@ -334,7 +386,21 @@ class ChatStore:
 
     async def set_last_user_input(self, user_id: int, content: Any) -> None:
         async with self._lock:
+            # Сохраняем ОРИГИНАЛ (с base64) — нужен для /regenerate.
             self._last_user_input[user_id] = content
+
+    # ── Last response messages (для /regenerate) ──────────────────────
+    async def set_last_response_messages(
+        self, user_id: int, pairs: List[Tuple[int, int]]
+    ) -> None:
+        async with self._lock:
+            self._last_response_messages[user_id] = list(pairs)
+
+    async def pop_last_response_messages(
+        self, user_id: int
+    ) -> List[Tuple[int, int]]:
+        async with self._lock:
+            return self._last_response_messages.pop(user_id, [])
 
     # ── Cooldown ──────────────────────────────────────────────────────
     async def check_cooldown(
@@ -472,8 +538,12 @@ class ChatStore:
 
     async def append_user(self, user_id: int, content: Any) -> None:
         async with self._lock:
+            # FIX: стрипаем base64 — история читается обратно только как
+            # текст, так что base64 в памяти = мёртвый груз (десятки МБ
+            # при активном использовании альбомов).
+            stripped = _strip_image_payloads(content)
             self._history.setdefault(user_id, []).append(
-                {"role": "user", "content": content}
+                {"role": "user", "content": stripped}
             )
             self._trim(user_id)
 

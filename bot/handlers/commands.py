@@ -44,7 +44,9 @@ async def cmd_start(message: Message) -> None:
         "📝 Отправьте текст, фото или альбом — LM Studio обработает запрос.\n"
         "🔄 Кнопка <b>Заново</b> — перегенерировать последний ответ.\n"
         "⏹ Кнопка <b>Остановить</b> или команда <code>/stop</code> — прервать генерацию.\n"
-        "🧹 <code>/clean</code> — очистить историю диалога.\n"
+        "🧹<code>/resetctx</code> — сбросить контекст модели "
+        "/clean — очистить историю и сообщения\n"
+        "(сообщения в чате остаются).\n"
         "📊 <code>/models</code> — управление моделями (список, загрузка, выгрузка).\n\n"
         "🚫 <b>Не поддерживается:</b> стикеры, видео, GIF, голосовые, аудио.\n"
         "⚠️ Пока идёт генерация, новые сообщения игнорируются.\n"
@@ -180,25 +182,36 @@ async def cmd_unload(message: Message) -> None:
         return
 
     try:
+        # FIX: используем run_with_progress и правим ОДНО сообщение,
+        # как в cmd_load — вместо «статус + отдельное финальное сообщение».
         if target.lower() == "all":
             sent = await message.answer("⏳ Выгружаю все модели…")
             await store.track_message(user_id, sent.chat.id, sent.message_id)
-            results = await unload_all_models()
-            sent = await message.answer(f"✅ Выгружено моделей: {len(results)}")
-        else:
-            sent = await message.answer(f"⏳ Выгружаю <code>{safe_code(target)}</code>…")
-            await store.track_message(user_id, sent.chat.id, sent.message_id)
+            header = "⏏ Выгружаю все модели"
             try:
-                await unload_model(target)
-                sent = await message.answer(
+                results = await run_with_progress(header, sent, unload_all_models())
+                await sent.edit_text(f"✅ Выгружено моделей: {len(results)}")
+            except Exception as exc:
+                log.exception("Unload all failed")
+                await sent.edit_text(
+                    f"❌ Не удалось выгрузить все модели: <code>{safe_code(exc)}</code>"
+                )
+        else:
+            sent = await message.answer(
+                f"⏳ Выгружаю <code>{safe_code(target)}</code>…"
+            )
+            await store.track_message(user_id, sent.chat.id, sent.message_id)
+            header = f"⏏ Выгружаю <code>{safe_code(target)}</code>"
+            try:
+                await run_with_progress(header, sent, unload_model(target))
+                await sent.edit_text(
                     f"✅ Instance <code>{safe_code(target)}</code> выгружен."
                 )
             except Exception as exc:
                 log.exception("Unload failed")
-                sent = await message.answer(
+                await sent.edit_text(
                     f"❌ Не удалось выгрузить: <code>{safe_code(exc)}</code>"
                 )
-        await store.track_message(user_id, sent.chat.id, sent.message_id)
     finally:
         await store.release_model_op()
 
@@ -289,6 +302,7 @@ async def cmd_help(message: Message) -> None:
         "/help — этот список\n"
         "/about — о боте и аптайм\n"
         "/clean — очистить историю и сообщения\n"
+        "/resetctx — сбросить контекст модели (сообщения остаются)\n"
         "/stop — остановить генерацию\n\n"
         "🧠 <b>Модель и параметры</b>\n"
         "/models — список моделей LM Studio\n"
@@ -354,8 +368,8 @@ async def _set_numeric(message: Message, name: str, **limits) -> None:
     args = (message.text or "").split(maxsplit=1)
     if len(args) < 2:
         sent = await message.answer(
-    f"❌ Использование: <code>/{name} &lt;значение&gt;</code>"
-)
+            f"❌ Использование: <code>/{name} &lt;значение&gt;</code>"
+        )
         await store.track_message(user_id, sent.chat.id, sent.message_id)
         return
 
@@ -371,7 +385,7 @@ async def _set_numeric(message: Message, name: str, **limits) -> None:
     hi = limits.get("max")
     is_int = limits.get("int", False)
 
-    if lo is not None and val_float < lo or hi is not None and val_float > hi:
+    if (lo is not None and val_float < lo) or (hi is not None and val_float > hi):
         sent = await message.answer(f"❌ Диапазон: {lo} – {hi}.")
         await store.track_message(user_id, sent.chat.id, sent.message_id)
         return
@@ -603,8 +617,7 @@ async def cmd_about(message: Message) -> None:
         f"⏱ <b>Аптайм:</b> <code>{uptime_str()}</code>\n"
         f"🧠 <b>Модель:</b> <code>{safe_code(model_display)}</code>\n"
         f"📚 <b>История:</b> до <b>{config.MAX_HISTORY_TURNS}</b> пар сообщений\n"
-        f"🖼 <b>Картинок за раз:</b> {config.MAX_IMAGES} "
-        f"(до {config.MAX_IMAGES_EXTENDED} в расширенном режиме)\n"
+        f"🖼 <b>Картинок за раз:</b> {config.MAX_IMAGES_EXTENDED}\n"
         f"✂️ <b>Макс. длина запроса:</b> {config.MAX_INPUT_CHARS} символов"
     )
     sent = await message.answer(text)
@@ -682,4 +695,18 @@ async def cmd_think(message: Message) -> None:
             "<code>/think on</code> — включить\n"
             "<code>/think off</code> — выключить"
         )
+    await store.track_message(user_id, sent.chat.id, sent.message_id)
+
+@router.message(Command("resetctx", "fresh"))
+async def cmd_resetctx(message: Message) -> None:
+    """Сбросить контекст модели, но оставить сообщения в чате."""
+    user_id = message.from_user.id
+    await store.reset_model_context(user_id)
+    sent = await message.answer(
+        "🧠 <b>Контекст модели сброшен.</b>\n\n"
+        "Локальная история диалога, stateful-сессия LM Studio и счётчик "
+        "токенов обнулены — следующее сообщение начнёт новую сессию.\n\n"
+        "💬 Сообщения в чате остались на месте.\n"
+        "🧹 Полная очистка (с удалением сообщений): <code>/clean</code>"
+    )
     await store.track_message(user_id, sent.chat.id, sent.message_id)

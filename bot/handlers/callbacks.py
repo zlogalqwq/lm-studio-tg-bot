@@ -110,15 +110,26 @@ async def cb_regenerate(query: CallbackQuery) -> None:
             await query.answer("Нечего перегенерировать", show_alert=True)
             return
 
-        # Откатываем локальную историю на один шаг (убираем прошлый assistant).
         await store.drop_last_assistant(user_id)
-
-        # Откатываем состояние LM Studio на один шаг назад.
         await store.rollback_response_id(user_id)
         prev_id = await store.get_response_id(user_id)
 
         await query.answer("🔄 Генерирую заново…")
 
+        # FIX: удаляем ВСЕ чанки предыдущего ответа — иначе после длинного
+        # ответа (несколько сообщений) остаются висеть «хвосты».
+        for chat_id, msg_id in await store.pop_last_response_messages(user_id):
+            try:
+                await bot.delete_message(chat_id, msg_id)
+            except Exception:
+                log.debug(
+                    "Failed to delete previous response msg %s/%s",
+                    chat_id, msg_id,
+                )
+            await store.untrack_message(user_id, chat_id, msg_id)
+
+        # Fallback: если трекер почему-то пуст (напр. после рестарта) —
+        # хотя бы убираем исходное сообщение с кнопкой.
         try:
             await query.message.delete()
         except Exception:
@@ -140,9 +151,6 @@ async def cb_regenerate(query: CallbackQuery) -> None:
             system_prompt = await store.get_system_prompt(user_id)
             thinking_enabled = await store.is_thinking_enabled()
 
-            # История уже без последнего assistant (drop_last_assistant),
-            # но с последним user — который мы и регенерируем. Убираем
-            # его из history_context, чтобы не дублировать.
             history_for_context = await store.get_with_system(user_id)
             if history_for_context and history_for_context[-1].get("role") == "user":
                 history_for_context = history_for_context[:-1]
@@ -158,8 +166,8 @@ async def cb_regenerate(query: CallbackQuery) -> None:
                 use_tools=await store.is_tools_enabled(),
                 thinking_enabled=thinking_enabled,
                 history_context=history_for_context,
-                loaded_context_length=loaded_ctx,                               
-                prev_prompt_tokens=await store.get_cumulative_tokens(user_id),  
+                loaded_context_length=loaded_ctx,
+                prev_prompt_tokens=await store.get_cumulative_tokens(user_id),
             )
 
             if session_reset:
@@ -175,7 +183,7 @@ async def cb_regenerate(query: CallbackQuery) -> None:
                 history_now = await store.get_with_system(user_id)
                 estimated = estimate_context_tokens(history_now)
                 cumulative = await store.update_cumulative_tokens(
-                    user_id, usage["prompt_tokens"]
+                    user_id, usage["prompt_tokens"], estimated_total=estimated,
                 )
                 effective = max(estimated, cumulative)
 
@@ -210,34 +218,38 @@ async def cb_regenerate(query: CallbackQuery) -> None:
             await finalize_and_track(user_id, status, sent)
 
         except (RuntimeError, ValueError) as exc:
-            try:
-                await status.edit_text(
-                    f"❌ {safe_code(exc)}",
-                    reply_markup=response_keyboard(),
-                )
-            except Exception:
-                pass
+            if status is None:
+                log.warning("Regenerate failed before status created: %s", exc)
+            else:
+                try:
+                    await status.edit_text(
+                        f"❌ {exc}",
+                        reply_markup=response_keyboard(),
+                    )
+                except Exception:
+                    log.debug("Failed to show regenerate error", exc_info=True)
         except httpx.RequestError:
-            try:
-                await status.edit_text(
-                    "❌ Не удалось подключиться к LM Studio.",
-                    reply_markup=response_keyboard(),
-                )
-            except Exception:
-                pass
+            if status is not None:
+                try:
+                    await status.edit_text(
+                        "❌ Не удалось подключиться к LM Studio.",
+                        reply_markup=response_keyboard(),
+                    )
+                except Exception:
+                    pass
         except Exception:
             log.exception("Regenerate error for user %s", user_id)
-            try:
-                await status.edit_text(
-                    "❌ Произошла ошибка при перегенерации.",
-                    reply_markup=response_keyboard(),
-                )
-            except Exception:
-                pass
+            if status is not None:
+                try:
+                    await status.edit_text(
+                        "❌ Произошла ошибка при перегенерации.",
+                        reply_markup=response_keyboard(),
+                    )
+                except Exception:
+                    pass
     finally:
         await store.end_generation(user_id)
         await store.release(user_id)
-
     
 # ── Новые колбэки: управление моделями ──
 
@@ -400,3 +412,9 @@ async def cb_model_reload(query: CallbackQuery) -> None:
             )
     finally:
         await store.release_model_op()
+
+@router.callback_query(F.data == "reset_context")
+async def cb_reset_context(query: CallbackQuery) -> None:
+    user_id = query.from_user.id
+    await store.reset_model_context(user_id)
+    await query.answer("🧠 Контекст модели сброшен", show_alert=True)

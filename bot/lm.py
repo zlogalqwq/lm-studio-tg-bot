@@ -268,12 +268,45 @@ async def fetch_models() -> List[str]:
 
 
 async def get_model() -> str:
+    # 1. Приоритет — уже загруженная модель в LM Studio.
+    #    Иначе LM Studio JIT-загрузит ту, что мы укажем в запросе
+    #    (обычно — первая попавшаяся), выгрузив текущую.
+    try:
+        loaded = await list_loaded_instances()
+    except Exception:
+        log.debug("get_model: list_loaded_instances failed", exc_info=True)
+        loaded = []
+
+    if loaded:
+        loaded_keys = {
+            inst.get("model_key") for inst in loaded if inst.get("model_key")
+        }
+
+        # Если DEFAULT_MODEL задан и он уже загружен — используем его.
+        if config.DEFAULT_MODEL and config.DEFAULT_MODEL in loaded_keys:
+            return config.DEFAULT_MODEL
+
+        # DEFAULT_MODEL задан, но загружена другая — используем загруженную.
+        # Явное действие пользователя в LM Studio важнее дефолта из .env.
+        if config.DEFAULT_MODEL:
+            log.warning(
+                "get_model: DEFAULT_MODEL=%r is not loaded; "
+                "using already loaded model=%r instead",
+                config.DEFAULT_MODEL, loaded[0]["model_key"],
+            )
+
+        return loaded[0]["model_key"]
+
+    # 2. Ничего не загружено. Если DEFAULT_MODEL задан — используем его.
     if config.DEFAULT_MODEL:
         return config.DEFAULT_MODEL
+
+    # 3. Fallback — первая из кэша / списка.
     if not store.models_expired:
         cached = store.get_cached_models()
         if cached:
             return cached[0]
+
     models = await fetch_models()
     if not models:
         raise RuntimeError(
@@ -446,6 +479,20 @@ def _to_native_input(msg: Any) -> Any:
     if not native:
         raise ValueError(
             "Пустое или нераспознанное содержимое для native API LM Studio."
+        )
+
+    # ── Наблюдаемость: сколько картинок реально уходит в модель. ──
+    # Если в логе видно 4 image(s) при 5 отправленных — проблема
+    # на этапе сборки альбома, а не в отправке в LM Studio.
+    n_img = sum(
+        1 for p in native
+        if isinstance(p, dict) and p.get("type") == "image"
+    )
+    n_txt = len(native) - n_img
+    if n_img:
+        log.info(
+            "native input: %d image(s), %d text part(s) attached",
+            n_img, n_txt,
         )
     return native
 
@@ -904,70 +951,45 @@ async def chat_completion(
 
 # ─────────────────────── анимация ожидания ───────────────────────
 
-_THINKING_EMOJIS = (
-    "🧠", "💭", "✨", "⚡", "🎯", "🎨", "🚀", "💫",
-    "🌟", "🔮", "⚙️", "🛰️", "🌀", "📡", "🪄", "🔭",
+# «Свинг»: блок ▓ катится туда-обратно по полю ░ на всю ширину.
+# Движение через всё сообщение → заметно с первого взгляда,
+# в отличие от маленького спиннера в углу.
+# Один полный проход туда-обратно — 8 секунд (1 с на кадр —
+# в пределах негласного rate-limit Telegram на edit_text).
+_WAIT_FRAMES = (
+    "▓▓░░░░░░",
+    "░▓▓░░░░░",
+    "░░▓▓░░░░",
+    "░░░▓▓░░░",
+    "░░░░▓▓░░",
+    "░░░▓▓░░░",
+    "░░▓▓░░░░",
+    "░▓▓░░░░░",
 )
 
-_THINKING_VERBS = (
-    "Генерирую", "Думаю", "Размышляю", "Соображаю",
-    "Считаю токены", "Ворожу", "Собираю мысли", "Творю",
-    "Кручу шестерёнки", "Советуюсь с моделью", "Ищу ответ", "Пишу",
-)
+_WAIT_INTERVAL = 1.0
 
-_THINKING_TAILS = (
-    "…", "… почти", "… ещё чуть-чуть", "… уже близко",
-    "… без паники", "… не спеша", "… со вкусом", "… вдумчиво",
-    "… на максималках", "… по классике", "… аккуратно",
-    "… в фоне", "… без лишнего шума", "… и немного магии",
-    "… как следует",
-)
-
-_THINKING_ACCENTS = (
-    "🫧 токены летят", "🎼 подбираю рифму", "🍵 завариваю ответ",
-    "🧩 складываю пазл", "🛠 подкручиваю гайки", "🎲 бросаю кубики",
-    "🪄 колдую над промптом", "📚 листаю контекст",
-    "🌊 синхронизируюсь с сервером", "🛰 жду пакет с ответом",
-    "🐢 медленно, но верно", "🦾 держу удар",
-)
-
-_THINKING_MIN_INTERVAL = 0.9
-_THINKING_MAX_INTERVAL = 1.6
-_THINKING_ACCENT_CHANCE = 0.35
-
-
-def _pick_tail(prev: Optional[str]) -> str:
-    if prev is None or len(_THINKING_TAILS) <= 1:
-        return random.choice(_THINKING_TAILS)
-    tail = random.choice(_THINKING_TAILS)
-    while tail == prev:
-        tail = random.choice(_THINKING_TAILS)
-    return tail
-
-
-def _render_thinking_frame(tick: int, tail: str) -> str:
-    emoji = _THINKING_EMOJIS[tick % len(_THINKING_EMOJIS)]
-    verb = _THINKING_VERBS[tick % len(_THINKING_VERBS)]
-
-    frame = f"{emoji} {verb}{tail}"
-    if random.random() < _THINKING_ACCENT_CHANCE:
-        frame += "\n<i>" + random.choice(_THINKING_ACCENTS) + "</i>"
-    return frame
+# Фраза выбирается в начале сессии и не меняется — движется только полоса,
+# никакого визуального шума.
+_WAIT_PHRASES = ("⏳Думаю", "⏳Генерирую", "⏳Обрабатываю", "⏳Пишу ответ")
 
 
 async def _animate_thinking(status: Message, stop: asyncio.Event) -> None:
     tick = 0
-    prev_tail: Optional[str] = None
-    while not stop.is_set():
-        prev_tail = _pick_tail(prev_tail)
-        frame = _render_thinking_frame(tick, prev_tail)
+    phrase = random.choice(_WAIT_PHRASES)
+    n = len(_WAIT_FRAMES)
 
-        wait_time = random.uniform(_THINKING_MIN_INTERVAL, _THINKING_MAX_INTERVAL)
+    while not stop.is_set():
+        frame = f"{phrase} {_WAIT_FRAMES[tick % n]}"
+
+        wait_time = _WAIT_INTERVAL
         try:
             await status.edit_text(frame, reply_markup=stop_keyboard())
         except TelegramRetryAfter as exc:
+            # Telegram попросил подождать — уважаем и не жжём дальше.
             wait_time = float(exc.retry_after) + 0.2
         except TelegramBadRequest:
+            # «message is not modified» и подобное — не фатально.
             pass
         except Exception:
             log.debug("thinking animation edit failed", exc_info=True)

@@ -1,12 +1,20 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from typing import List, Dict, Any
+from typing import List
 
 
 def response_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔄 Заново", callback_data="regenerate"),
-        InlineKeyboardButton(text="🧹 Очистить", callback_data="clean_chat"),
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔄 Заново", callback_data="regenerate"),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🧠 Сброс контекста",
+                callback_data="reset_context",
+            ),
+            InlineKeyboardButton(text="🧹 Очистить", callback_data="clean_chat"),
+        ],
+    ])
 
 
 def stop_keyboard() -> InlineKeyboardMarkup:
@@ -16,7 +24,6 @@ def stop_keyboard() -> InlineKeyboardMarkup:
 
 
 def models_keyboard(models: List[str]) -> InlineKeyboardMarkup:
-    """Клавиатура для выбора модели из списка."""
     buttons = [
         [InlineKeyboardButton(text=f"📦 {m}", callback_data=f"model_select:{m}")]
         for m in models
@@ -25,7 +32,6 @@ def models_keyboard(models: List[str]) -> InlineKeyboardMarkup:
 
 
 def model_actions_keyboard(model_key: str, is_loaded: bool) -> InlineKeyboardMarkup:
-    """Клавиатура действий с конкретной моделью."""
     rows: List[List[InlineKeyboardButton]] = []
     if is_loaded:
         rows.append([
@@ -52,7 +58,6 @@ def model_actions_keyboard(model_key: str, is_loaded: bool) -> InlineKeyboardMar
 
 
 def confirm_clear_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура подтверждения очистки истории."""
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🗑 Да, очистить", callback_data="clean_confirm"),
         InlineKeyboardButton(text="↩️ Отмена",       callback_data="clean_cancel"),

@@ -1,7 +1,8 @@
 import asyncio
 import logging
 import re
-from typing import Any, Callable, Dict, List
+import time
+from typing import Any, Callable, Dict, List, Optional
 
 from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, Message
@@ -24,7 +25,6 @@ class AuthMiddleware(BaseMiddleware):
         if user is None:
             return await handler(event, data)
 
-        # Проверка авторизации — fail-closed: если упало, считаем «не авторизован».
         try:
             is_auth = await store.is_authorized(user.id)
         except Exception as exc:
@@ -82,66 +82,73 @@ class AuthMiddleware(BaseMiddleware):
 
 
 class MediaGroupCollector(BaseMiddleware):
-    def __init__(self, latency: float = config.MEDIA_GROUP_LATENCY) -> None:
-        self.latency = latency
-        self._pending: Dict[str, List[Message]] = {}
+    """Адаптивная группировка альбомов: ждёт тишины `latency` секунд,
+    но не дольше `max_wait` от первой фотографии."""
 
-    async def __call__(
-        self,
-        handler: Callable,
-        event: Message,
-        data: Dict[str, Any],
-    ) -> Any:
+    def __init__(self, latency: Optional[float] = None) -> None:
+        self.latency = (
+            latency if latency is not None else config.MEDIA_GROUP_LATENCY
+        )
+        self.max_wait = getattr(config, "MEDIA_GROUP_MAX_WAIT", 5.0)
+        self._pending: Dict[str, List[Message]] = {}
+        self._last_arrival: Dict[str, float] = {}
+        self._lock = asyncio.Lock()
+
+    async def __call__(self, handler: Callable, event: Message, data: Dict[str, Any]) -> Any:
         try:
             if event.from_user is not None:
                 await store.track_message(
                     event.from_user.id, event.chat.id, event.message_id
                 )
         except Exception as exc:
-            dump_exception(
-                exc, context="MediaGroupCollector.track", event=event
-            )
+            dump_exception(exc, context="MediaGroupCollector.track", event=event)
             log.exception("track_message failed")
 
         mgid = event.media_group_id
         if mgid is None:
             return await handler(event, data)
 
-        try:
+        async with self._lock:
             bucket = self._pending.setdefault(mgid, [])
             bucket.append(event)
-        except Exception as exc:
-            dump_exception(
-                exc, context="MediaGroupCollector.bucket", event=event
-            )
-            log.exception("bucket handling failed")
+            self._last_arrival[mgid] = time.monotonic()
+            is_first = len(bucket) == 1
+
+        if not is_first:
             return None
 
-        if len(bucket) != 1:
-            return None
-
-        try:
+        start = time.monotonic()
+        while True:
+            # FIX: проверяем max_wait ДО sleep, чтобы не вылезать за лимит.
+            if time.monotonic() - start >= self.max_wait:
+                break
             await asyncio.sleep(self.latency)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            dump_exception(
-                exc, context="MediaGroupCollector.sleep", event=event
-            )
+            async with self._lock:
+                last = self._last_arrival.get(mgid, 0.0)
+            if time.monotonic() - last >= self.latency:
+                break
 
-        self._pending.pop(mgid, None)
-        data["album"] = list(bucket)
+        async with self._lock:
+            album = self._pending.pop(mgid, [])
+            self._last_arrival.pop(mgid, None)
+
+        album.sort(key=lambda m: m.message_id)
+
+        log.info(
+            "Media group %s collected: %d photo(s) (waited %.2fs)",
+            mgid, len(album), time.monotonic() - start,
+        )
+
+        data["album"] = album
         try:
             await handler(event, data)
         except Exception:
             log.exception("Error handling media group %s", mgid)
-            raise  # пусть поймает глобальный @dp.errors()
+            raise
         return None
 
 
 class CommandLoggerMiddleware(BaseMiddleware):
-    """Логирует команды пользователя и нажатия inline-кнопок."""
-
     async def __call__(self, handler, event, data):
         try:
             user = getattr(event, "from_user", None)
@@ -167,18 +174,10 @@ class CommandLoggerMiddleware(BaseMiddleware):
             )
             log.exception("CommandLoggerMiddleware crashed")
 
-        # ВАЖНО: вызов хендлера — вне try, чтобы его ошибка ушла наверх.
         return await handler(event, data)
 
 
 class CommandCooldownMiddleware(BaseMiddleware):
-    """Кулдаун между командами одного пользователя.
-
-    Не трогает не-команды и команды из COMMAND_COOLDOWN_EXEMPT.
-    На превышение отвечает одним коротким сообщением и глушит хендлер.
-    Если что-то падает внутри проверки — пропускаем запрос (fail-open).
-    """
-
     async def __call__(self, handler, event, data):
         try:
             block, left, user_id = await self._should_block(event)
@@ -203,11 +202,9 @@ class CommandCooldownMiddleware(BaseMiddleware):
                 )
             return None
 
-        # Хендлер — вне try.
         return await handler(event, data)
 
     async def _should_block(self, event):
-        """(block, left, user_id) — решение о блокировке."""
         if not isinstance(event, Message):
             return False, 0.0, None
 

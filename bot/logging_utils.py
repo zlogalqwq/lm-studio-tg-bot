@@ -14,7 +14,7 @@ log = logging.getLogger(__name__)
 _log_lock = asyncio.Lock()
 
 from aiogram.types import Message
-from typing import Any, List
+
 
 async def finalize_and_track(
     user_id: int,
@@ -27,6 +27,9 @@ async def finalize_and_track(
       запись в трекере сохраняется как есть — без дублей.
     * Случай 2 (`finalize` удалил `status` и прислал новые сообщения):
       `status` снимается с трекера, новые сообщения регистрируются.
+
+    Дополнительно запоминает список ВСЕХ сообщений ответа — чтобы
+    `/regenerate` мог удалить их целиком, а не только последний чанк.
     """
     status_key = (status.chat.id, status.message_id)
     sent_keys = {(m.chat.id, m.message_id) for m in sent}
@@ -37,6 +40,12 @@ async def finalize_and_track(
     for m in sent:
         if (m.chat.id, m.message_id) != status_key:
             await store.track_message(user_id, m.chat.id, m.message_id)
+
+    # FIX: запоминаем состав ответа — для корректного /regenerate.
+    await store.set_last_response_messages(
+        user_id, [(m.chat.id, m.message_id) for m in sent]
+    )
+
 
 def _extract_text(content: Any) -> str:
     if isinstance(content, str):

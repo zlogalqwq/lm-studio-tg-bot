@@ -19,6 +19,7 @@ _BOLD_STASH = "\x02B{}\x02"
 # Атрибуты внутри тега не содержат < или >, поэтому [^<>]* достаточно.
 _TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9-]*)[^<>]*>")
 
+
 def safe_code(value: object, limit: int = 64) -> str:
     """Экранирует значение для вставки внутрь <code>...</code> и обрезает его."""
     if value is None:
@@ -28,8 +29,10 @@ def safe_code(value: object, limit: int = 64) -> str:
         s = s[: limit - 1] + "…"
     return html.escape(s, quote=False)
 
+
 def _italic(s: str) -> str:
     return re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>", s)
+
 
 def md_to_html(text: str) -> str:
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -63,6 +66,7 @@ def md_to_html(text: str) -> str:
         text = text.replace(_PLACEHOLDER.format(i), block)
     return text
 
+
 # ─────────────────────────── HTML-нарезание ───────────────────────────
 
 def _open_tags(fragment: str) -> List[str]:
@@ -76,6 +80,7 @@ def _open_tags(fragment: str) -> List[str]:
         else:
             stack.append(name)
     return stack
+
 
 def _split_html(text: str, limit: int = 4000) -> List[str]:
     """Режет HTML на части ≤ limit, никогда не разрывая тег.
@@ -108,7 +113,13 @@ def _split_html(text: str, limit: int = 4000) -> List[str]:
         # cut==0 или слишком ранний разрез — гарантируем прогресс жёсткой резкой.
         if cut == 0 or cut < limit // 4:
             cut = limit
-            open_at_cut = _open_tags(window)
+            # НЕ режем внутри тега: если последний '<' идёт после последнего '>',
+            # мы находимся в середине незавершённого тега. Сдвигаем рез к '<'.
+            last_lt = window.rfind("<")
+            last_gt = window.rfind(">")
+            if last_lt > last_gt and last_lt > 0:
+                cut = last_lt
+            open_at_cut = _open_tags(window[:cut])
 
         chunk = rest[:cut].rstrip()
         if open_at_cut:
@@ -121,6 +132,7 @@ def _split_html(text: str, limit: int = 4000) -> List[str]:
     if rest.strip():
         chunks.append(rest)
     return chunks
+
 
 # ─────────────────────────── отправка ───────────────────────────
 
@@ -141,6 +153,7 @@ async def _safe_answer(
                 raise
             reply_markup = None  # ретрай без клавиатуры
     raise RuntimeError("Не удалось отправить сообщение в Telegram")
+
 
 async def send_formatted(
     target: Message,
@@ -170,6 +183,7 @@ async def send_formatted(
         )
     return sent
 
+
 # ─────────────────────── финализация стрима ───────────────────────
 
 async def _edit_status(
@@ -189,7 +203,6 @@ async def _edit_status(
             return False
     except TelegramBadRequest as exc:
         if "not modified" in str(exc).lower():
-            # Текст и разметка уже актуальны — дожимаем только клавиатуру.
             try:
                 await status.edit_reply_markup(reply_markup=markup)
             except Exception:
@@ -203,6 +216,7 @@ async def _edit_status(
         log.exception("finalize: edit_text unexpected error")
         return False
 
+
 async def finalize_streamed(
     status: Message,
     reply: str,
@@ -212,9 +226,8 @@ async def finalize_streamed(
 ) -> List[Message]:
     if not reply or not reply.strip():
         reply = "⏹ Остановлено." if stopped else "⚠️ Модель вернула пустой ответ."
-        stopped = False  # маркер уже содержится в тексте
+        stopped = False
 
-    # Хвост — уже готовая HTML-разметка.
     suffix = ""
     if stopped:
         suffix += "\n\n<i>⏹ (остановлено пользователем)</i>"
@@ -227,21 +240,17 @@ async def finalize_streamed(
 
     markup = response_keyboard()
 
-    # ── Случай 1: короткий ответ — правим одно сообщение ──
     if len(formatted) <= 4000:
         if await _edit_status(status, formatted, markup):
             log.info("finalize: edit ok (len=%d)", len(formatted))
             return [status]
 
-        # Ретрай без клавиатуры: иногда ломаются именно entities кнопок.
         try:
             await status.edit_text(formatted)
             try:
                 await status.edit_reply_markup(reply_markup=markup)
             except Exception:
-                log.debug(
-                    "finalize: markup edit after bare text", exc_info=True
-                )
+                log.debug("finalize: markup edit after bare text", exc_info=True)
             log.info("finalize: bare edit ok")
             return [status]
         except TelegramRetryAfter as exc:
@@ -256,7 +265,6 @@ async def finalize_streamed(
             except Exception as exc2:
                 log.info("finalize: bare edit retry failed: %s", exc2)
 
-    # ── Случай 2: длинный ответ — статус становится первым чанком ──
     chunks = _split_html(formatted, 4000)
     total = len(chunks)
 
@@ -267,21 +275,17 @@ async def finalize_streamed(
             log.debug("finalize: status delete failed", exc_info=True)
 
     def _with_counter(chunk: str, index: int) -> str:
-        """Добавляет «(i/N)» внутрь валидного HTML (после балансировки тегов)."""
         return f"{chunk.rstrip()}\n\n<i>({index}/{total})</i>"
 
-    # Первый чанк: переиспользуем статус, клавиатуру на нём не держим.
     first = _with_counter(chunks[0], 1) if total > 1 else chunks[0]
     sent: List[Message] = []
 
     if await _edit_status(status, first, None):
         sent.append(status)
     else:
-        # Статус не редактируется (удалён/слишком старый) — чистим и шлём заново.
         await _delete_quietly()
         sent.append(await _safe_answer(fallback_target, first))
 
-    # Остаток: отдельными сообщениями, клавиатура — только на последнем.
     for i, chunk in enumerate(chunks[1:], start=2):
         is_last = i == total
         body = chunk if is_last else _with_counter(chunk, i)
